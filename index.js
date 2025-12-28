@@ -1,41 +1,40 @@
 const express = require("express")
 const Razorpay = require("razorpay")
 const cors = require("cors")
-const nodemailer = require("nodemailer")
+const { Resend } = require("resend")
 
 const app = express()
 app.use(cors())
 app.use(express.json())
 
-const transporter = nodemailer.createTransport({
-    service: "gmail",
-    auth: {
-        user: "soulscriptlegacy@gmail.com",
-        pass: process.env.GMAIL_APP_PASSWORD,
-    },
-})
+// 📧 RESEND CLIENT
+const resend = new Resend(process.env.RESEND_API_KEY)
 
+// 💳 RAZORPAY
 const razorpay = new Razorpay({
     key_id: process.env.RAZORPAY_KEY_ID,
     key_secret: process.env.RAZORPAY_KEY_SECRET,
 })
 
+// 🧾 CREATE RAZORPAY ORDER
 app.post("/create-order", async (req, res) => {
-  const amount = req.body.amount
+    try {
+        const amount = req.body.amount
 
-  const order = await razorpay.orders.create({
-    amount: amount * 100,
-    currency: "INR",
-    receipt: "order_" + Date.now(),
-  })
+        const order = await razorpay.orders.create({
+            amount: amount * 100,
+            currency: "INR",
+            receipt: "order_" + Date.now(),
+        })
 
-  res.json(order)
+        res.json(order)
+    } catch (err) {
+        console.error("Order error:", err)
+        res.status(500).json({ error: "Order creation failed" })
+    }
 })
 
-app.listen(3000, () => {
-  console.log("Server running")
-})
-
+// 📦 RECEIVE SHIPPING + SEND EMAIL
 app.post("/submit-shipping", async (req, res) => {
     const { name, phone, email, address, edition } = req.body
 
@@ -44,9 +43,9 @@ app.post("/submit-shipping", async (req, res) => {
     }
 
     try {
-        await transporter.sendMail({
-            from: "SoulScript Legacy <soulscriptlegacy@gmail.com>",
-            to: "soulscriptlegacy@gmail.com",
+        await resend.emails.send({
+            from: "SoulScript Legacy <onboarding@resend.dev>",
+            to: ["soulscriptlegacy@gmail.com"],
             subject: `🖤 New Order – ${edition}`,
             html: `
                 <h2>New Order Received</h2>
@@ -60,8 +59,13 @@ app.post("/submit-shipping", async (req, res) => {
 
         res.json({ success: true })
     } catch (err) {
-        console.error(err)
-        res.status(500).json({ error: "Failed to send email" })
+        console.error("Email error:", err)
+        res.status(500).json({ error: "Email failed" })
     }
+})
+
+// 🚀 START SERVER
+app.listen(3000, () => {
+    console.log("✅ Server running on port 3000")
 })
 
