@@ -108,10 +108,7 @@ app.post("/confirm-payment", async (req, res) => {
                 email: shipping.email,
                 phone: shipping.phone,
                 address: shipping.address,
-                payment_mod:
-                    normalizedPaymentType === "PREPAID"
-                        ? "FULL"
-                        : "COD_ADVANCE",
+            
             },
         ])
 
