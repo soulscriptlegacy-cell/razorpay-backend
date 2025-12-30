@@ -42,7 +42,7 @@ app.post("/create-order", async (req, res) => {
         }
 
         const order = await razorpay.orders.create({
-            amount: amount * 100,
+            amount: amount * 100, // ₹ → paise
             currency: "INR",
             receipt: "order_" + Date.now(),
         })
@@ -56,9 +56,6 @@ app.post("/create-order", async (req, res) => {
 
 /* =========================
    CONFIRM PAYMENT
-   → VERIFY
-   → INSERT ORDER (NEW)
-   → SEND EMAIL
 ========================= */
 app.post("/confirm-payment", async (req, res) => {
     const {
@@ -96,39 +93,36 @@ app.post("/confirm-payment", async (req, res) => {
         }
 
         /* ---------- NORMALIZE PAYMENT TYPE ---------- */
-        const readablePaymentType =
-            paymentType === "PREPAID"
-                ? "PREPAID"
-                : "COD_ADVANCE"
+        const normalizedPaymentType =
+            paymentType === "PREPAID" ? "PREPAID" : "COD_ADVANCE"
 
-        /* ---------- 🔥 INSERT INTO SUPABASE ---------- */
-    const { error: dbError } = await supabase.from("orders").insert([
-  {
-    razorpay_order_id: orderId,
-    razorpay_payment_id: paymentId,
-    edition,
-    payment_type: readablePaymentType,
-    amount: amount,
-    name: shipping.name,
-    email: shipping.email,
-    phone: shipping.phone,
-    address: shipping.address,
-    payment_mode:
-      readablePaymentType === "PREPAID"
-        ? "FULL"
-        : "COD_ADVANCE",
-  },
-])
+        /* ---------- INSERT INTO SUPABASE (NON-BLOCKING) ---------- */
+        const { error: dbError } = await supabase.from("orders").insert([
+            {
+                razorpay_order_id: orderId,
+                razorpay_payment_id: paymentId,
+                edition,
+                payment_type: normalizedPaymentType,
+                amount,
+                name: shipping.name,
+                email: shipping.email,
+                phone: shipping.phone,
+                address: shipping.address,
+                payment_mod:
+                    normalizedPaymentType === "PREPAID"
+                        ? "FULL"
+                        : "COD_ADVANCE",
+            },
+        ])
+
         if (dbError) {
-            console.error("❌ Supabase insert failed:", dbError)
-            return res
-                .status(500)
-                .json({ error: "Order saved failed" })
+            // ⚠️ DO NOT FAIL PAYMENT FLOW
+            console.error("⚠️ Supabase insert failed:", dbError)
+        } else {
+            console.log("✅ Order saved to Supabase")
         }
 
-        console.log("✅ Order saved to Supabase")
-
-        /* ---------- SEND EMAIL ---------- */
+        /* ---------- SEND EMAIL (ALWAYS) ---------- */
         await resend.emails.send({
             from: "SoulScript Legacy <onboarding@resend.dev>",
             to: ["soulscriptlegacy@gmail.com"],
@@ -137,7 +131,11 @@ app.post("/confirm-payment", async (req, res) => {
                 <h2>New Order Confirmed</h2>
 
                 <p><strong>Edition:</strong> ${edition}</p>
-                <p><strong>Payment Type:</strong> ${readablePaymentType}</p>
+                <p><strong>Payment Type:</strong> ${
+                    normalizedPaymentType === "PREPAID"
+                        ? "Paid in full"
+                        : "COD (Advance Paid)"
+                }</p>
                 <p><strong>Amount Paid:</strong> ₹${amount}</p>
                 <p><strong>Razorpay Payment ID:</strong> ${paymentId}</p>
                 <p><strong>Order ID:</strong> ${orderId}</p>
@@ -153,12 +151,13 @@ app.post("/confirm-payment", async (req, res) => {
 
         console.log("📨 Email sent successfully")
 
-        res.json({ success: true })
+        /* ---------- ALWAYS RETURN SUCCESS ---------- */
+        return res.json({ success: true })
     } catch (err) {
         console.error("❌ Confirmation error:", err)
-        res.status(500).json({
-            error: "Payment verified but processing failed",
-        })
+
+        // 🔒 Never break frontend after payment
+        return res.json({ success: true })
     }
 })
 
