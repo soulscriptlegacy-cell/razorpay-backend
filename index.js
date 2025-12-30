@@ -102,21 +102,23 @@ app.post("/confirm-payment", async (req, res) => {
                 : "COD_ADVANCE"
 
         /* ---------- 🔥 INSERT INTO SUPABASE ---------- */
-        const { error: dbError } = await supabase.from("orders").insert([
-            {
-                razorpay_order_id: orderId,
-                razorpay_payment_id: paymentId,
-                edition,
-                payment_type: readablePaymentType,
-                payment_status: "PAID", // advance counts as PAID
-                amount_paid: amount,
-                customer_name: shipping.name,
-                customer_email: shipping.email,
-                customer_phone: shipping.phone,
-                shipping_address: shipping.address,
-            },
-        ])
-
+    const { error: dbError } = await supabase.from("orders").insert([
+  {
+    razorpay_order_id: orderId,
+    razorpay_payment_id: paymentId,
+    edition,
+    payment_type: readablePaymentType,
+    amount: amount,
+    name: shipping.name,
+    email: shipping.email,
+    phone: shipping.phone,
+    address: shipping.address,
+    payment_mode:
+      readablePaymentType === "PREPAID"
+        ? "FULL"
+        : "COD_ADVANCE",
+  },
+])
         if (dbError) {
             console.error("❌ Supabase insert failed:", dbError)
             return res
