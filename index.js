@@ -3,10 +3,19 @@ const Razorpay = require("razorpay")
 const crypto = require("crypto")
 const cors = require("cors")
 const { Resend } = require("resend")
+const { createClient } = require("@supabase/supabase-js")
 
 const app = express()
 app.use(cors())
 app.use(express.json())
+
+/* =========================
+   SUPABASE (SOURCE OF TRUTH)
+========================= */
+const supabase = createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_SERVICE_ROLE_KEY
+)
 
 /* =========================
    EMAIL (RESEND)
@@ -33,7 +42,7 @@ app.post("/create-order", async (req, res) => {
         }
 
         const order = await razorpay.orders.create({
-            amount: amount * 100, // ₹ → paise
+            amount: amount * 100,
             currency: "INR",
             receipt: "order_" + Date.now(),
         })
@@ -46,8 +55,10 @@ app.post("/create-order", async (req, res) => {
 })
 
 /* =========================
-   CONFIRM PAYMENT (VERIFIED)
-   + SEND EMAIL
+   CONFIRM PAYMENT
+   → VERIFY
+   → INSERT ORDER (NEW)
+   → SEND EMAIL
 ========================= */
 app.post("/confirm-payment", async (req, res) => {
     const {
@@ -60,7 +71,6 @@ app.post("/confirm-payment", async (req, res) => {
         shipping,
     } = req.body
 
-    /* ---------- BASIC VALIDATION ---------- */
     if (
         !paymentId ||
         !orderId ||
@@ -82,23 +92,39 @@ app.post("/confirm-payment", async (req, res) => {
 
         if (expectedSignature !== razorpaySignature) {
             console.error("❌ Invalid Razorpay signature")
-            return res
-                .status(400)
-                .json({ error: "Invalid payment signature" })
+            return res.status(400).json({ error: "Invalid payment signature" })
         }
 
-        /* ---------- FORMAT PAYMENT TYPE ---------- */
+        /* ---------- NORMALIZE PAYMENT TYPE ---------- */
         const readablePaymentType =
             paymentType === "PREPAID"
-                ? "Full Prepaid"
-                : "Cash on Delivery (₹1,750 Advance)"
+                ? "PREPAID"
+                : "COD_ADVANCE"
 
-        console.log("✅ Payment verified:", {
-            edition,
-            paymentType: readablePaymentType,
-            amount,
-            paymentId,
-        })
+        /* ---------- 🔥 INSERT INTO SUPABASE ---------- */
+        const { error: dbError } = await supabase.from("orders").insert([
+            {
+                razorpay_order_id: orderId,
+                razorpay_payment_id: paymentId,
+                edition,
+                payment_type: readablePaymentType,
+                payment_status: "PAID", // advance counts as PAID
+                amount_paid: amount,
+                customer_name: shipping.name,
+                customer_email: shipping.email,
+                customer_phone: shipping.phone,
+                shipping_address: shipping.address,
+            },
+        ])
+
+        if (dbError) {
+            console.error("❌ Supabase insert failed:", dbError)
+            return res
+                .status(500)
+                .json({ error: "Order saved failed" })
+        }
+
+        console.log("✅ Order saved to Supabase")
 
         /* ---------- SEND EMAIL ---------- */
         await resend.emails.send({
@@ -125,12 +151,11 @@ app.post("/confirm-payment", async (req, res) => {
 
         console.log("📨 Email sent successfully")
 
-        /* ---------- FINAL RESPONSE ---------- */
         res.json({ success: true })
     } catch (err) {
         console.error("❌ Confirmation error:", err)
         res.status(500).json({
-            error: "Payment verified but email failed",
+            error: "Payment verified but processing failed",
         })
     }
 })
