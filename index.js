@@ -198,7 +198,7 @@ app.post("/submit-story", async (req, res) => {
             .update({
                 story,
                 story_submitted: true,
-                submitted_at: new Date().toISOString(),
+      
             })
             .eq("id", order.id)
 
