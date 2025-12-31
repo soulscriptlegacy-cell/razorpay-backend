@@ -234,7 +234,7 @@ ${order.story}
 
         console.log("📨 Story submitted email sent")
 
-        return res.json({ success: true })
+        return res.json({ success: true, story_submitted: true })
     } catch (err) {
         console.error("❌ Submit story error:", err)
 
