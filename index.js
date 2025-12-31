@@ -159,6 +159,90 @@ app.post("/confirm-payment", async (req, res) => {
 })
 
 /* =========================
+   SUBMIT STORY
+   → FETCH FROM SUPABASE
+   → LOCK STORY
+   → EMAIL FULL STORY
+========================= */
+app.post("/submit-story", async (req, res) => {
+    const { orderId } = req.body
+
+    if (!orderId) {
+        return res.status(400).json({ error: "Order ID missing" })
+    }
+
+    try {
+        /* ---------- FETCH ORDER ---------- */
+        const { data: order, error } = await supabase
+            .from("orders")
+            .select("*")
+            .eq("razorpay_order_id", orderId)
+            .single()
+
+        if (error || !order) {
+            console.error("❌ Order not found:", error)
+            return res.status(404).json({ error: "Order not found" })
+        }
+
+        /* ---------- PREVENT DOUBLE SUBMIT ---------- */
+        if (order.story_submitted) {
+            return res.json({ success: true })
+        }
+
+        if (!order.story || !order.story.trim()) {
+            return res.status(400).json({ error: "Story is empty" })
+        }
+
+        /* ---------- LOCK STORY ---------- */
+        await supabase
+            .from("orders")
+            .update({
+                story_submitted: true,
+                submitted_at: new Date().toISOString(),
+            })
+            .eq("id", order.id)
+
+        /* ---------- SEND STORY EMAIL ---------- */
+        await resend.emails.send({
+            from: "SoulScript Legacy <onboarding@resend.dev>",
+            to: ["soulscriptlegacy@gmail.com"],
+            subject: `📖 Story Submitted – ${order.edition}`,
+            html: `
+                <h2>New Story Submitted</h2>
+
+                <p><strong>Edition:</strong> ${order.edition}</p>
+                <p><strong>Payment Type:</strong> ${
+                    order.payment_type === "PREPAID"
+                        ? "Paid in full"
+                        : "COD (Advance Paid)"
+                }</p>
+
+                <hr />
+
+                <p><strong>Name:</strong> ${order.name}</p>
+                <p><strong>Email:</strong> ${order.email}</p>
+                <p><strong>Phone:</strong> ${order.phone}</p>
+
+                <hr />
+
+                <h3>Story</h3>
+                <pre style="white-space: pre-wrap; font-family: serif;">
+${order.story}
+                </pre>
+            `,
+        })
+
+        console.log("📨 Story submitted email sent")
+
+        return res.json({ success: true })
+    } catch (err) {
+        console.error("❌ Submit story error:", err)
+
+        // Never break UX
+        return res.json({ success: true })
+    }
+})
+/* =========================
    START SERVER
 ========================= */
 const PORT = process.env.PORT || 3000
