@@ -164,11 +164,14 @@ app.post("/confirm-payment", async (req, res) => {
    → LOCK STORY
    → EMAIL FULL STORY
 ========================= */
+/* =========================
+   SUBMIT STORY (AUTHORITATIVE)
+========================= */
 app.post("/submit-story", async (req, res) => {
-    const { orderId } = req.body
+    const { orderId, story } = req.body
 
-    if (!orderId) {
-        return res.status(400).json({ error: "Order ID missing" })
+    if (!orderId || !story || !story.trim()) {
+        return res.status(400).json({ error: "Order ID or story missing" })
     }
 
     try {
@@ -186,23 +189,25 @@ app.post("/submit-story", async (req, res) => {
 
         /* ---------- PREVENT DOUBLE SUBMIT ---------- */
         if (order.story_submitted) {
-            return res.json({ success: true })
+            return res.json({ success: true, story_submitted: true })
         }
 
-        if (!order.story || !order.story.trim()) {
-            return res.status(400).json({ error: "Story is empty" })
-        }
-
-        /* ---------- LOCK STORY ---------- */
-        await supabase
+        /* ---------- SAVE + LOCK (ONE WRITE) ---------- */
+        const { error: updateError } = await supabase
             .from("orders")
             .update({
+                story,
                 story_submitted: true,
                 submitted_at: new Date().toISOString(),
             })
             .eq("id", order.id)
 
-        /* ---------- SEND STORY EMAIL ---------- */
+        if (updateError) {
+            console.error("❌ Story update failed:", updateError)
+            return res.status(500).json({ error: "Failed to save story" })
+        }
+
+        /* ---------- SEND EMAIL ---------- */
         await resend.emails.send({
             from: "SoulScript Legacy <onboarding@resend.dev>",
             to: ["soulscriptlegacy@gmail.com"],
@@ -227,7 +232,7 @@ app.post("/submit-story", async (req, res) => {
 
                 <h3>Story</h3>
                 <pre style="white-space: pre-wrap; font-family: serif;">
-${order.story}
+${story}
                 </pre>
             `,
         })
@@ -237,8 +242,6 @@ ${order.story}
         return res.json({ success: true, story_submitted: true })
     } catch (err) {
         console.error("❌ Submit story error:", err)
-
-        // Never break UX
         return res.json({ success: true })
     }
 })
