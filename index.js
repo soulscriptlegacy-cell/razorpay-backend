@@ -1,13 +1,10 @@
-// index.js (FULL UPDATED FILE v3)
-// ✅ Adds Admin endpoints so admin.tsx can see orders safely
-// IMPORTANT: admin.tsx should call backend endpoints (NOT supabase directly)
-// Required Render env vars:
-// - SUPABASE_URL
-// - SUPABASE_SERVICE_ROLE_KEY
-// - RESEND_API_KEY (optional for admin panel, but keep for your current flows)
-// - ADMIN_KEY (NEW)  <-- this is admin password
-// Optional env vars:
-// - EMAIL_FROM, PORTAL_BASE_URL, ADMIN_EMAIL
+// index.js (FULL UPDATED FILE v2)
+// ✅ Fixes added in THIS version:
+// 1) /send-portal-link returns REAL Resend error message in JSON (no more guessing)
+// 2) If Resend blocks customer-send (403), auto-fallback sends to ADMIN (soulscriptlegacy@gmail.com)
+//    so you can verify flow while domain is Pending.
+// 3) Added /debug/email endpoint to test Resend quickly
+// 4) Stronger env validation + safer error serialization
 
 const express = require("express")
 const Razorpay = require("razorpay")
@@ -24,12 +21,12 @@ const app = express()
 app.use(
   cors({
     origin: "*",
-    methods: ["GET", "POST", "PATCH", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "x-admin-key"],
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
   })
 )
 
-app.use(express.json({ limit: "4mb" }))
+app.use(express.json({ limit: "2mb" }))
 
 /* =========================
    HELPERS
@@ -41,11 +38,14 @@ const must = (key) => {
 }
 
 const safeErr = (e) => {
+  // Normalize random error shapes into something readable
   const obj = {
     message: e?.message || String(e),
     name: e?.name,
     statusCode: e?.statusCode || e?.status,
   }
+
+  // Resend sometimes includes useful fields
   if (e?.response) obj.response = e.response
   if (e?.cause) obj.cause = e.cause
   if (e?.stack) obj.stack = e.stack.split("\n").slice(0, 6).join("\n")
@@ -53,7 +53,7 @@ const safeErr = (e) => {
 }
 
 /* =========================
-   SUPABASE (SERVICE ROLE)
+   SUPABASE
 ========================= */
 const supabase = createClient(
   must("SUPABASE_URL"),
@@ -64,28 +64,18 @@ const supabase = createClient(
    RESEND
 ========================= */
 const resend = new Resend(must("RESEND_API_KEY"))
+
+// Email sender (Render env: EMAIL_FROM)
+// IMPORTANT: while domain is Pending, keep this as onboarding@resend.dev
 const EMAIL_FROM =
   process.env.EMAIL_FROM || "SoulScript Legacy <onboarding@resend.dev>"
+
+// FRONTEND base URL (Framer)
 const PORTAL_BASE_URL =
   process.env.PORTAL_BASE_URL || "https://soulscriptlegacy.com"
+
+// Admin inbox for fallbacks
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || "soulscriptlegacy@gmail.com"
-
-/* =========================
-   ADMIN AUTH (SIMPLE PASSWORD)
-========================= */
-const ADMIN_KEY = must("ADMIN_KEY") // SET THIS IN RENDER ENV
-
-const requireAdmin = (req, res, next) => {
-  try {
-    const key = String(req.headers["x-admin-key"] || "").trim()
-    if (!key || key !== ADMIN_KEY) {
-      return res.status(401).json({ error: "Unauthorized (admin)" })
-    }
-    return next()
-  } catch (e) {
-    return res.status(401).json({ error: "Unauthorized (admin)" })
-  }
-}
 
 /* =========================
    RAZORPAY
@@ -105,7 +95,6 @@ app.get("/health", (req, res) => {
     portalBase: PORTAL_BASE_URL,
     emailFrom: EMAIL_FROM,
     adminEmail: ADMIN_EMAIL,
-    adminAuth: Boolean(ADMIN_KEY),
   })
 })
 
@@ -126,139 +115,6 @@ app.get("/debug/email", async (req, res) => {
     const err = safeErr(e)
     console.error("❌ /debug/email failed:", err)
     return res.status(500).json({ success: false, error: err })
-  }
-})
-
-/* =========================
-   ADMIN API (NEW)
-   admin.tsx will call these endpoints
-========================= */
-
-// List orders (supports search + pagination)
-app.get("/admin/orders", requireAdmin, async (req, res) => {
-  try {
-    const page = Math.max(1, parseInt(req.query.page || "1", 10))
-    const limit = Math.min(100, Math.max(5, parseInt(req.query.limit || "25", 10)))
-    const offset = (page - 1) * limit
-
-    const q = String(req.query.q || "").trim().toLowerCase()
-    const submitted = String(req.query.submitted || "").trim() // "true" | "false" | ""
-
-    // Base query
-    let query = supabase
-      .from("orders")
-      .select(
-        "id, created_at, razorpay_order_id, edition, payment_type, amount, name, email, phone, story_submitted, story, address, portal_token_used, portal_token_expires_at",
-        { count: "exact" }
-      )
-      .order("created_at", { ascending: false })
-      .range(offset, offset + limit - 1)
-
-    // Filter by story_submitted
-    if (submitted === "true") query = query.eq("story_submitted", true)
-    if (submitted === "false") query = query.eq("story_submitted", false)
-
-    // Simple search (email/phone/order id/name)
-    if (q) {
-      // supabase OR filter needs exact format
-      // note: ilike is supported for text columns
-      query = query.or(
-        `email.ilike.%${q}%,phone.ilike.%${q}%,razorpay_order_id.ilike.%${q}%,name.ilike.%${q}%`
-      )
-    }
-
-    const { data, error, count } = await query
-    if (error) {
-      console.error("❌ /admin/orders error:", error)
-      return res.status(500).json({ error: "Failed to load orders" })
-    }
-
-    return res.json({
-      success: true,
-      page,
-      limit,
-      total: count || 0,
-      orders: data || [],
-    })
-  } catch (e) {
-    console.error("❌ /admin/orders crash:", safeErr(e))
-    return res.status(500).json({ error: "Server error" })
-  }
-})
-
-// Get single order
-app.get("/admin/orders/:id", requireAdmin, async (req, res) => {
-  try {
-    const id = req.params.id
-    const { data, error } = await supabase
-      .from("orders")
-      .select("*")
-      .eq("id", id)
-      .single()
-
-    if (error || !data) return res.status(404).json({ error: "Order not found" })
-    return res.json({ success: true, order: data })
-  } catch (e) {
-    console.error("❌ /admin/orders/:id crash:", safeErr(e))
-    return res.status(500).json({ error: "Server error" })
-  }
-})
-
-// Update order fields (admin control)
-app.patch("/admin/orders/:id", requireAdmin, async (req, res) => {
-  try {
-    const id = req.params.id
-
-    // Allow only safe fields to be updated from admin panel
-    const allowed = [
-      "story_submitted",
-      "story",
-      "payment_type",
-      "edition",
-      "amount",
-      "name",
-      "email",
-      "phone",
-      "address",
-
-      // If you later add these columns, admin can update:
-      "status",
-      "admin_notes",
-      "cover_preview_path",
-      "cover_print_path",
-      "manuscript_preview_path",
-      "manuscript_print_path",
-      "allow_extra_voice_notes",
-      "revision_allowed",
-      "revision_submitted",
-      "terminated",
-    ]
-
-    const patch = {}
-    for (const k of allowed) {
-      if (Object.prototype.hasOwnProperty.call(req.body, k)) patch[k] = req.body[k]
-    }
-
-    if (Object.keys(patch).length === 0) {
-      return res.status(400).json({ error: "No valid fields in update" })
-    }
-
-    const { data, error } = await supabase
-      .from("orders")
-      .update(patch)
-      .eq("id", id)
-      .select("*")
-      .single()
-
-    if (error || !data) {
-      console.error("❌ /admin/orders PATCH error:", error)
-      return res.status(500).json({ error: "Failed to update order" })
-    }
-
-    return res.json({ success: true, order: data })
-  } catch (e) {
-    console.error("❌ /admin/orders PATCH crash:", safeErr(e))
-    return res.status(500).json({ error: "Server error" })
   }
 })
 
@@ -346,19 +202,278 @@ app.post("/confirm-payment", async (req, res) => {
 
     // Admin email (don’t break checkout if it fails)
     try {
-      await resend.emails.send({
+      const r = await resend.emails.send({
         from: EMAIL_FROM,
         to: [ADMIN_EMAIL],
         subject: `🖤 New Order Confirmed – ${edition}`,
-        html: `<p>Order created: ${orderId}</p>`,
+        html: `
+          <h2>New Order Confirmed</h2>
+          <p><strong>Edition:</strong> ${edition}</p>
+          <p><strong>Payment Type:</strong> ${
+            normalizedPaymentType === "PREPAID"
+              ? "Paid in full"
+              : "COD (Advance Paid)"
+          }</p>
+          <p><strong>Amount Paid:</strong> ₹${amount}</p>
+          <p><strong>Razorpay Payment ID:</strong> ${paymentId}</p>
+          <p><strong>Order ID:</strong> ${orderId}</p>
+          <hr />
+          <p><strong>Name:</strong> ${shipping.name}</p>
+          <p><strong>Phone:</strong> ${shipping.phone}</p>
+          <p><strong>Email:</strong> ${shipping.email || "-"}</p>
+          <p><strong>Address:</strong><br/>${shipping.address}</p>
+        `,
       })
+      console.log("📨 Admin email sent:", r?.id || r)
     } catch (e) {
       console.error("❌ Resend admin email failed:", safeErr(e))
     }
 
     return res.json({ success: true })
   } catch (err) {
-    console.error("❌ Confirmation error:", safeErr(err))
+    console.error("❌ Confirmation error:", err)
+    return res.json({ success: true })
+  }
+})
+
+/* =========================
+   SEND PORTAL LINK
+========================= */
+app.post("/send-portal-link", async (req, res) => {
+  try {
+    const { email } = req.body
+    const normalizedEmail = String(email || "").trim().toLowerCase()
+
+    if (!normalizedEmail || !normalizedEmail.includes("@")) {
+      return res.status(400).json({ error: "Valid email required" })
+    }
+
+    const { data: order, error } = await supabase
+      .from("orders")
+      .select("id, razorpay_order_id, edition, email, created_at")
+      .eq("email", normalizedEmail)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .single()
+
+    if (error || !order) {
+      console.error("❌ No order found for email:", normalizedEmail, error)
+      return res.status(404).json({ error: "No order found for this email" })
+    }
+
+    const token = crypto.randomBytes(24).toString("hex")
+    const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString()
+
+    const { error: upErr } = await supabase
+      .from("orders")
+      .update({
+        portal_token: token,
+        portal_token_expires_at: expiresAt,
+        portal_token_used: false,
+      })
+      .eq("id", order.id)
+
+    if (upErr) {
+      console.error("❌ Failed to save token:", upErr)
+      return res.status(500).json({ error: "Failed to create link" })
+    }
+
+    const portalUrl = `${PORTAL_BASE_URL}/story?token=${token}`
+
+    const html = `
+      <div style="font-family: Inter, Arial, sans-serif; line-height:1.6;">
+        <p>Hi,</p>
+        <p>Here is your secure link to continue your story:</p>
+        <p>
+          <a href="${portalUrl}" style="display:inline-block;padding:12px 16px;background:#000;color:#fff;text-decoration:none;border-radius:10px;">
+            Open My Story Portal
+          </a>
+        </p>
+        <p style="color:#555;font-size:13px;">This link expires in 30 minutes.</p>
+        <p>— SoulScript Legacy</p>
+      </div>
+    `
+
+    // 1) Try sending to the customer
+    try {
+      const r = await resend.emails.send({
+        from: EMAIL_FROM,
+        to: [normalizedEmail],
+        subject: "Your SoulScript Legacy writing link",
+        html,
+      })
+      console.log("📨 Portal email sent to customer:", normalizedEmail, r?.id || r)
+      return res.json({ success: true, portalUrl })
+    } catch (e) {
+      const err = safeErr(e)
+      console.error("❌ Resend portal email failed (customer):", err)
+
+      // 2) If Resend blocks (usually 403 during pending domain / test mode),
+      // fallback send to ADMIN so flow doesn't block development.
+      try {
+        const r2 = await resend.emails.send({
+          from: EMAIL_FROM,
+          to: [ADMIN_EMAIL],
+          subject: "⚠️ Portal link fallback (customer blocked)",
+          html: `
+            <p><b>Customer email (blocked):</b> ${normalizedEmail}</p>
+            <p><b>Reason:</b> ${err?.message || "Resend blocked"}</p>
+            <hr/>
+            ${html}
+          `,
+        })
+        console.log("📨 Portal email fallback sent to admin:", ADMIN_EMAIL, r2?.id || r2)
+
+        return res.json({
+          success: true,
+          portalUrl,
+          warning:
+            "Resend blocked sending to customer (domain pending/test mode). Sent fallback to admin email instead.",
+          resend_error: err,
+        })
+      } catch (e2) {
+        const err2 = safeErr(e2)
+        console.error("❌ Resend portal email failed (admin fallback):", err2)
+        return res.status(500).json({
+          error: "Email sending failed (Resend).",
+          resend_error_customer: err,
+          resend_error_admin: err2,
+          portalUrl, // still return so you can keep moving
+        })
+      }
+    }
+  } catch (e) {
+    console.error("❌ /send-portal-link error:", safeErr(e))
+    return res.status(500).json({ error: "Server error" })
+  }
+})
+
+/* =========================
+   OPEN PORTAL USING TOKEN
+========================= */
+app.get("/portal-order", async (req, res) => {
+  try {
+    const token = String(req.query.token || "").trim()
+    const redirect = String(req.query.redirect || "").trim() === "1"
+
+    if (!token) return res.status(400).json({ error: "Token missing" })
+
+    const { data: order, error } = await supabase
+      .from("orders")
+      .select("*")
+      .eq("portal_token", token)
+      .single()
+
+    if (error || !order) {
+      return res.status(404).json({ error: "Invalid link" })
+    }
+
+    if (order.portal_token_used) {
+      return res
+        .status(410)
+        .json({ error: "Link already used. Please request a new link." })
+    }
+
+    if (order.portal_token_expires_at) {
+      const exp = new Date(order.portal_token_expires_at).getTime()
+      if (Date.now() > exp) {
+        return res
+          .status(410)
+          .json({ error: "Link expired. Please request a new link." })
+      }
+    }
+
+    const { error: usedErr } = await supabase
+      .from("orders")
+      .update({ portal_token_used: true })
+      .eq("id", order.id)
+
+    if (usedErr) console.error("⚠️ Failed to mark token used:", usedErr)
+
+    if (redirect) {
+      const target = `${PORTAL_BASE_URL}/story?order=${encodeURIComponent(
+        order.razorpay_order_id
+      )}`
+      return res.redirect(302, target)
+    }
+
+    return res.json({ success: true, order })
+  } catch (e) {
+    console.error("❌ /portal-order error:", safeErr(e))
+    return res.status(500).json({ error: "Server error" })
+  }
+})
+
+/* =========================
+   SUBMIT STORY
+========================= */
+app.post("/submit-story", async (req, res) => {
+  const { orderId, story } = req.body
+
+  if (!orderId || !story || !story.trim()) {
+    return res.status(400).json({ error: "Order ID or story missing" })
+  }
+
+  try {
+    const { data: order, error } = await supabase
+      .from("orders")
+      .select("*")
+      .eq("razorpay_order_id", orderId)
+      .single()
+
+    if (error || !order) {
+      console.error("❌ Order not found:", error)
+      return res.status(404).json({ error: "Order not found" })
+    }
+
+    if (order.story_submitted) {
+      return res.json({ success: true, story_submitted: true })
+    }
+
+    const { error: updateError } = await supabase
+      .from("orders")
+      .update({
+        story,
+        story_submitted: true,
+      })
+      .eq("id", order.id)
+
+    if (updateError) {
+      console.error("❌ Story update failed:", updateError)
+      return res.status(500).json({ error: "Failed to save story" })
+    }
+
+    // Admin email (don’t break customer UX)
+    try {
+      const r = await resend.emails.send({
+        from: EMAIL_FROM,
+        to: [ADMIN_EMAIL],
+        subject: `📖 Story Submitted – ${order.edition}`,
+        html: `
+          <h2>New Story Submitted</h2>
+          <p><strong>Edition:</strong> ${order.edition}</p>
+          <p><strong>Payment Type:</strong> ${
+            order.payment_type === "PREPAID"
+              ? "Paid in full"
+              : "COD (Advance Paid)"
+          }</p>
+          <hr />
+          <p><strong>Name:</strong> ${order.name}</p>
+          <p><strong>Email:</strong> ${order.email}</p>
+          <p><strong>Phone:</strong> ${order.phone}</p>
+          <hr />
+          <h3>Story</h3>
+          <pre style="white-space: pre-wrap; font-family: serif;">${story}</pre>
+        `,
+      })
+      console.log("📨 Story email sent:", r?.id || r)
+    } catch (e) {
+      console.error("❌ Resend story email failed:", safeErr(e))
+    }
+
+    return res.json({ success: true, story_submitted: true })
+  } catch (err) {
+    console.error("❌ Submit story error:", safeErr(err))
     return res.json({ success: true })
   }
 })
@@ -372,5 +487,4 @@ app.listen(PORT, () => {
   console.log(`✅ PORTAL_BASE_URL = ${PORTAL_BASE_URL}`)
   console.log(`✅ EMAIL_FROM      = ${EMAIL_FROM}`)
   console.log(`✅ ADMIN_EMAIL     = ${ADMIN_EMAIL}`)
-  console.log(`✅ ADMIN_KEY set?  = ${Boolean(ADMIN_KEY)}`)
 })
