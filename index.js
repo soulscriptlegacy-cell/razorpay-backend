@@ -68,7 +68,7 @@ const resend = new Resend(must("RESEND_API_KEY"))
 // Email sender (Render env: EMAIL_FROM)
 // IMPORTANT: while domain is Pending, keep this as onboarding@resend.dev
 const EMAIL_FROM =
-  process.env.EMAIL_FROM || "SoulScript Legacy <onboarding@resend.dev>"
+  process.env.EMAIL_FROM || "SoulScript Legacy <hello@soulscriptlegacy.com>"
 
 // FRONTEND base URL (Framer)
 const PORTAL_BASE_URL =
