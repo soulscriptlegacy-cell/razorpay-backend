@@ -27,7 +27,7 @@ const EMAIL_FROM =
   process.env.EMAIL_FROM || "SoulScript Legacy <onboarding@resend.dev>"
 
 // Your website base URL (set in Render env: PORTAL_BASE_URL)
-const PORTAL_BASE_URL = process.env.PORTAL_BASE_URL || "https://soulscriptlegacy.com"
+const PORTAL_BASE_URL = process.env.PORTAL_BASE_URL || "https://api.soulscriptlegacy.com"
 
 /* =========================
    RAZORPAY
