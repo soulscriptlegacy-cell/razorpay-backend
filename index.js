@@ -16,6 +16,51 @@ const { createClient } = require("@supabase/supabase-js")
 const app = express()
 
 /* =========================
+   AIRTABLE DISPATCH HOOK
+========================= */
+app.post("/hooks/dispatch", async (req, res) => {
+  try {
+    const secret = String(req.header("x-hook-secret") || "").trim()
+
+    if (!AIRTABLE_WEBHOOK_SECRET) {
+      console.warn("⚠️ AIRTABLE_WEBHOOK_SECRET missing in env")
+      return res.status(500).json({ ok: false, error: "Server not configured" })
+    }
+
+    if (secret !== AIRTABLE_WEBHOOK_SECRET) {
+      return res.status(401).json({ ok: false, error: "Unauthorized" })
+    }
+
+    // Airtable should send something like: { recordId: "recXXXX" }
+    console.log("✅ Dispatch hook hit:", req.body)
+
+    const recordId = String(req.body?.recordId || "").trim()
+    if (!recordId) {
+      return res.status(400).json({ ok: false, error: "recordId missing" })
+    }
+
+    // OPTIONAL: If you store Airtable record IDs in Supabase orders table,
+    // you can fetch and do your logic here.
+    // Example (only if you have a column like airtable_record_id):
+    //
+    // const { data: order, error } = await supabase
+    //   .from("orders")
+    //   .select("*")
+    //   .eq("airtable_record_id", recordId)
+    //   .single()
+    //
+    // if (error || !order) return res.status(404).json({ ok:false, error:"Order not found" })
+    //
+    // ... trigger your dispatch email / update status / etc
+
+    return res.json({ ok: true, received: { recordId } })
+  } catch (e) {
+    console.error("❌ /hooks/dispatch error:", safeErr(e))
+    return res.status(500).json({ ok: false, error: safeErr(e) })
+  }
+})
+
+/* =========================
    BASIC MIDDLEWARE
 ========================= */
 app.use(
@@ -84,6 +129,7 @@ const razorpay = new Razorpay({
   key_id: must("RAZORPAY_KEY_ID"),
   key_secret: must("RAZORPAY_KEY_SECRET"),
 })
+const AIRTABLE_WEBHOOK_SECRET = process.env.AIRTABLE_WEBHOOK_SECRET || ""
 
 /* =========================
    HEALTH CHECK
