@@ -406,6 +406,52 @@ nextUrl: `/story?order=${razorpay_order_id}`,
 })
 
 /* =========================
+   CUSTOMER MY ORDERS
+========================= */
+app.get("/my-orders", async (req, res) => {
+  try {
+    const authHeader = String(req.header("Authorization") || "")
+
+    if (!authHeader.startsWith("Bearer ")) {
+      return res.status(401).json({ error: "Missing login token" })
+    }
+
+    const token = authHeader.replace("Bearer ", "").trim()
+
+    const { data: userData, error: userErr } = await supabase.auth.getUser(token)
+
+    if (userErr || !userData?.user?.email) {
+      console.error("❌ Invalid user token:", userErr)
+      return res.status(401).json({ error: "Invalid or expired login" })
+    }
+
+    const email = String(userData.user.email).trim().toLowerCase()
+
+    const { data: orders, error: ordersErr } = await supabase
+      .from("orders")
+      .select(
+        "id, razorpay_order_id, edition, payment_type, amount, name, phone, email, address, created_at, story_submitted"
+      )
+      .eq("email", email)
+      .order("created_at", { ascending: false })
+
+    if (ordersErr) {
+      console.error("❌ Failed to fetch customer orders:", ordersErr)
+      return res.status(500).json({ error: "Failed to fetch orders" })
+    }
+
+    return res.json({
+      success: true,
+      email,
+      orders: orders || [],
+    })
+  } catch (err) {
+    console.error("❌ /my-orders error:", safeErr(err))
+    return res.status(500).json({ error: "Server error" })
+  }
+})
+
+/* =========================
    SEND PORTAL LINK
 ========================= */
 app.post("/send-portal-link", async (req, res) => {
