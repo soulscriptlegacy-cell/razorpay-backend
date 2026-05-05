@@ -393,7 +393,7 @@ app.post("/confirm-payment", async (req, res) => {
 
     return res.json({
       success: true,
-      nextUrl: `/story/submit?order=${razorpay_order_id}`,
+nextUrl: `/story?order=${razorpay_order_id}`,
       razorpayOrderId: razorpay_order_id,
     })
   } catch (err) {
@@ -527,46 +527,56 @@ app.post("/send-portal-link", async (req, res) => {
 })
 
 /* =========================
-   OPEN PORTAL USING TOKEN
+   OPEN PORTAL USING TOKEN OR ORDER ID
 ========================= */
 app.get("/portal-order", async (req, res) => {
   try {
     const token = String(req.query.token || "").trim()
+    const orderId = String(req.query.order || "").trim()
     const redirect = String(req.query.redirect || "").trim() === "1"
 
-    if (!token) return res.status(400).json({ error: "Token missing" })
+    if (!token && !orderId) {
+      return res.status(400).json({ error: "Token or order ID missing" })
+    }
 
-    const { data: order, error } = await supabase
-      .from("orders")
-      .select("*")
-      .eq("portal_token", token)
-      .single()
+    let query = supabase.from("orders").select("*")
+
+    if (token) {
+      query = query.eq("portal_token", token)
+    } else {
+      query = query.eq("razorpay_order_id", orderId)
+    }
+
+    const { data: order, error } = await query.single()
 
     if (error || !order) {
-      return res.status(404).json({ error: "Invalid link" })
+      console.error("❌ Order not found:", error)
+      return res.status(404).json({ error: "Invalid link or order not found" })
     }
 
-    if (order.portal_token_used) {
-      return res
-        .status(410)
-        .json({ error: "Link already used. Please request a new link." })
-    }
-
-    if (order.portal_token_expires_at) {
-      const exp = new Date(order.portal_token_expires_at).getTime()
-      if (Date.now() > exp) {
+    if (token) {
+      if (order.portal_token_used) {
         return res
           .status(410)
-          .json({ error: "Link expired. Please request a new link." })
+          .json({ error: "Link already used. Please request a new link." })
       }
+
+      if (order.portal_token_expires_at) {
+        const exp = new Date(order.portal_token_expires_at).getTime()
+        if (Date.now() > exp) {
+          return res
+            .status(410)
+            .json({ error: "Link expired. Please request a new link." })
+        }
+      }
+
+      const { error: usedErr } = await supabase
+        .from("orders")
+        .update({ portal_token_used: true })
+        .eq("id", order.id)
+
+      if (usedErr) console.error("⚠️ Failed to mark token used:", usedErr)
     }
-
-    const { error: usedErr } = await supabase
-      .from("orders")
-      .update({ portal_token_used: true })
-      .eq("id", order.id)
-
-    if (usedErr) console.error("⚠️ Failed to mark token used:", usedErr)
 
     if (redirect) {
       const target = `${PORTAL_BASE_URL}/story?order=${encodeURIComponent(
@@ -581,7 +591,6 @@ app.get("/portal-order", async (req, res) => {
     return res.status(500).json({ error: "Server error" })
   }
 })
-
 /* =========================
    SUBMIT STORY
 ========================= */
