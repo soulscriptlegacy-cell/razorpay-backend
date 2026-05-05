@@ -1,10 +1,9 @@
-// index.js (FULL UPDATED FILE v2)
-// ✅ Fixes added in THIS version:
-// 1) /send-portal-link returns REAL Resend error message in JSON (no more guessing)
-// 2) If Resend blocks customer-send (403), auto-fallback sends to ADMIN (soulscriptlegacy@gmail.com)
-//    so you can verify flow while domain is Pending.
-// 3) Added /debug/email endpoint to test Resend quickly
-// 4) Stronger env validation + safer error serialization
+// index.js (SoulScript Legacy backend)
+// Checkout upgraded:
+// - Backend calculates prices safely
+// - Breeze Edition kept at ₹2 for testing
+// - Razorpay signature verification fixed
+// - Existing routes preserved: dispatch hook, email debug, portal link, portal order, submit story
 
 const express = require("express")
 const Razorpay = require("razorpay")
@@ -14,51 +13,6 @@ const { Resend } = require("resend")
 const { createClient } = require("@supabase/supabase-js")
 
 const app = express()
-
-/* =========================
-   AIRTABLE DISPATCH HOOK
-========================= */
-app.post("/hooks/dispatch", async (req, res) => {
-  try {
-    const secret = String(req.header("x-hook-secret") || "").trim()
-
-    if (!AIRTABLE_WEBHOOK_SECRET) {
-      console.warn("⚠️ AIRTABLE_WEBHOOK_SECRET missing in env")
-      return res.status(500).json({ ok: false, error: "Server not configured" })
-    }
-
-    if (secret !== AIRTABLE_WEBHOOK_SECRET) {
-      return res.status(401).json({ ok: false, error: "Unauthorized" })
-    }
-
-    // Airtable should send something like: { recordId: "recXXXX" }
-    console.log("✅ Dispatch hook hit:", req.body)
-
-    const recordId = String(req.body?.recordId || "").trim()
-    if (!recordId) {
-      return res.status(400).json({ ok: false, error: "recordId missing" })
-    }
-
-    // OPTIONAL: If you store Airtable record IDs in Supabase orders table,
-    // you can fetch and do your logic here.
-    // Example (only if you have a column like airtable_record_id):
-    //
-    // const { data: order, error } = await supabase
-    //   .from("orders")
-    //   .select("*")
-    //   .eq("airtable_record_id", recordId)
-    //   .single()
-    //
-    // if (error || !order) return res.status(404).json({ ok:false, error:"Order not found" })
-    //
-    // ... trigger your dispatch email / update status / etc
-
-    return res.json({ ok: true, received: { recordId } })
-  } catch (e) {
-    console.error("❌ /hooks/dispatch error:", safeErr(e))
-    return res.status(500).json({ ok: false, error: safeErr(e) })
-  }
-})
 
 /* =========================
    BASIC MIDDLEWARE
@@ -83,14 +37,12 @@ const must = (key) => {
 }
 
 const safeErr = (e) => {
-  // Normalize random error shapes into something readable
   const obj = {
     message: e?.message || String(e),
     name: e?.name,
     statusCode: e?.statusCode || e?.status,
   }
 
-  // Resend sometimes includes useful fields
   if (e?.response) obj.response = e.response
   if (e?.cause) obj.cause = e.cause
   if (e?.stack) obj.stack = e.stack.split("\n").slice(0, 6).join("\n")
@@ -110,26 +62,65 @@ const supabase = createClient(
 ========================= */
 const resend = new Resend(must("RESEND_API_KEY"))
 
-// Email sender (Render env: EMAIL_FROM)
-// IMPORTANT: while domain is Pending, keep this as onboarding@resend.dev
 const EMAIL_FROM =
   process.env.EMAIL_FROM || "SoulScript Legacy <hello@soulscriptlegacy.com>"
 
-// FRONTEND base URL (Framer)
 const PORTAL_BASE_URL =
   process.env.PORTAL_BASE_URL || "https://soulscriptlegacy.com"
 
-// Admin inbox for fallbacks
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || "soulscriptlegacy@gmail.com"
 
 /* =========================
    RAZORPAY
 ========================= */
+const RAZORPAY_KEY_ID = must("RAZORPAY_KEY_ID")
+const RAZORPAY_KEY_SECRET = must("RAZORPAY_KEY_SECRET")
+
 const razorpay = new Razorpay({
-  key_id: must("RAZORPAY_KEY_ID"),
-  key_secret: must("RAZORPAY_KEY_SECRET"),
+  key_id: RAZORPAY_KEY_ID,
+  key_secret: RAZORPAY_KEY_SECRET,
 })
+
 const AIRTABLE_WEBHOOK_SECRET = process.env.AIRTABLE_WEBHOOK_SECRET || ""
+
+/* =========================
+   PRICING RULES
+========================= */
+
+const EDITION_PRICES = {
+  "Breeze Edition": 2, // testing only
+  "Confession Edition": 1999,
+  "Classic Edition": 2599,
+  "Essence Edition": 3499,
+}
+
+const ULTRA_PRIORITY_PRICE = 1000
+
+function calculateCheckoutAmount({ edition, paymentType, ultraPriority }) {
+  const basePrice = EDITION_PRICES[edition]
+
+  if (!basePrice) {
+    throw new Error(`Invalid or unpriced edition: ${edition}`)
+  }
+
+  const addOnsTotal = ultraPriority ? ULTRA_PRIORITY_PRICE : 0
+  const totalOrderValue = basePrice + addOnsTotal
+
+  const amountToPay =
+    paymentType === "PREPAID"
+      ? totalOrderValue
+      : Math.ceil(totalOrderValue / 2)
+
+  const pendingAmount = totalOrderValue - amountToPay
+
+  return {
+    basePrice,
+    addOnsTotal,
+    totalOrderValue,
+    amountToPay,
+    pendingAmount,
+  }
+}
 
 /* =========================
    HEALTH CHECK
@@ -141,7 +132,38 @@ app.get("/health", (req, res) => {
     portalBase: PORTAL_BASE_URL,
     emailFrom: EMAIL_FROM,
     adminEmail: ADMIN_EMAIL,
+    pricing: EDITION_PRICES,
   })
+})
+
+/* =========================
+   AIRTABLE DISPATCH HOOK
+========================= */
+app.post("/hooks/dispatch", async (req, res) => {
+  try {
+    const secret = String(req.header("x-hook-secret") || "").trim()
+
+    if (!AIRTABLE_WEBHOOK_SECRET) {
+      console.warn("⚠️ AIRTABLE_WEBHOOK_SECRET missing in env")
+      return res.status(500).json({ ok: false, error: "Server not configured" })
+    }
+
+    if (secret !== AIRTABLE_WEBHOOK_SECRET) {
+      return res.status(401).json({ ok: false, error: "Unauthorized" })
+    }
+
+    console.log("✅ Dispatch hook hit:", req.body)
+
+    const recordId = String(req.body?.recordId || "").trim()
+    if (!recordId) {
+      return res.status(400).json({ ok: false, error: "recordId missing" })
+    }
+
+    return res.json({ ok: true, received: { recordId } })
+  } catch (e) {
+    console.error("❌ /hooks/dispatch error:", safeErr(e))
+    return res.status(500).json({ ok: false, error: safeErr(e) })
+  }
 })
 
 /* =========================
@@ -150,12 +172,14 @@ app.get("/health", (req, res) => {
 app.get("/debug/email", async (req, res) => {
   try {
     const to = String(req.query.to || ADMIN_EMAIL).trim().toLowerCase()
+
     const r = await resend.emails.send({
       from: EMAIL_FROM,
       to: [to],
       subject: "✅ Resend test (SoulScript)",
       html: `<p>If you got this, Resend API works.</p><p>Time: ${new Date().toISOString()}</p>`,
     })
+
     return res.json({ success: true, to, resend: r })
   } catch (e) {
     const err = safeErr(e)
@@ -169,19 +193,69 @@ app.get("/debug/email", async (req, res) => {
 ========================= */
 app.post("/create-order", async (req, res) => {
   try {
-    const { amount } = req.body
-    if (!amount) return res.status(400).json({ error: "Amount missing" })
+    const { edition, productSlug, paymentType, ultraPriority, customer } =
+      req.body
 
-    const order = await razorpay.orders.create({
-      amount: amount * 100,
-      currency: "INR",
-      receipt: "order_" + Date.now(),
+    if (!edition || !paymentType || !customer) {
+      return res.status(400).json({ error: "Missing checkout data" })
+    }
+
+    if (
+      !customer.name ||
+      !customer.phone ||
+      !customer.email ||
+      !customer.address
+    ) {
+      return res.status(400).json({ error: "Customer details missing" })
+    }
+
+    if (!["PREPAID", "ADVANCE"].includes(paymentType)) {
+      return res.status(400).json({ error: "Invalid payment type" })
+    }
+
+    const pricing = calculateCheckoutAmount({
+      edition,
+      paymentType,
+      ultraPriority: !!ultraPriority,
     })
 
-    return res.json(order)
+    const receipt = "ssl_" + Date.now()
+
+    const razorpayOrder = await razorpay.orders.create({
+      amount: pricing.amountToPay * 100,
+      currency: "INR",
+      receipt,
+      notes: {
+        edition,
+        productSlug: productSlug || "",
+        paymentType,
+        ultraPriority: ultraPriority ? "yes" : "no",
+        basePrice: String(pricing.basePrice),
+        addOnsTotal: String(pricing.addOnsTotal),
+        totalOrderValue: String(pricing.totalOrderValue),
+        amountToPay: String(pricing.amountToPay),
+        pendingAmount: String(pricing.pendingAmount),
+        customerName: customer.name,
+        customerEmail: String(customer.email).trim().toLowerCase(),
+        customerPhone: customer.phone,
+      },
+    })
+
+    return res.json({
+      success: true,
+      keyId: RAZORPAY_KEY_ID,
+      razorpayOrderId: razorpayOrder.id,
+      amount: razorpayOrder.amount,
+      currency: razorpayOrder.currency,
+      amountToPay: pricing.amountToPay,
+      totalOrderValue: pricing.totalOrderValue,
+      pendingAmount: pricing.pendingAmount,
+    })
   } catch (err) {
-    console.error("❌ Order creation failed:", err)
-    return res.status(500).json({ error: "Order creation failed" })
+    console.error("❌ /create-order failed:", safeErr(err))
+    return res.status(500).json({
+      error: err?.message || "Order creation failed",
+    })
   }
 })
 
@@ -189,66 +263,78 @@ app.post("/create-order", async (req, res) => {
    CONFIRM PAYMENT
 ========================= */
 app.post("/confirm-payment", async (req, res) => {
-  const {
-    paymentId,
-    orderId,
-    razorpaySignature,
-    amount,
-    paymentType,
-    edition,
-    shipping,
-  } = req.body
-
-  if (
-    !paymentId ||
-    !orderId ||
-    !razorpaySignature ||
-    !shipping ||
-    !shipping.name ||
-    !shipping.phone ||
-    !shipping.address
-  ) {
-    return res.status(400).json({ error: "Missing required data" })
-  }
-
   try {
+    const {
+      razorpay_payment_id,
+      razorpay_order_id,
+      razorpay_signature,
+      customer,
+    } = req.body
+
+    if (
+      !razorpay_payment_id ||
+      !razorpay_order_id ||
+      !razorpay_signature ||
+      !customer ||
+      !customer.name ||
+      !customer.phone ||
+      !customer.email ||
+      !customer.address
+    ) {
+      return res.status(400).json({ error: "Missing required payment data" })
+    }
+
     const expectedSignature = crypto
-      .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
-      .update(orderId + "|" + paymentId)
+      .createHmac("sha256", RAZORPAY_KEY_SECRET)
+      .update(razorpay_order_id + "|" + razorpay_payment_id)
       .digest("hex")
 
-    if (expectedSignature !== razorpaySignature) {
+    if (expectedSignature !== razorpay_signature) {
       console.error("❌ Invalid Razorpay signature")
       return res.status(400).json({ error: "Invalid payment signature" })
     }
 
-    const normalizedPaymentType =
-      paymentType === "PREPAID" ? "PREPAID" : "COD_ADVANCE"
+    const razorpayOrder = await razorpay.orders.fetch(razorpay_order_id)
+    const notes = razorpayOrder.notes || {}
 
-    const normalizedEmail = shipping.email
-      ? String(shipping.email).trim().toLowerCase()
-      : null
+    const edition = notes.edition
+    const paymentType = notes.paymentType
+    const amountToPay = Number(notes.amountToPay || 0)
+    const totalOrderValue = Number(notes.totalOrderValue || 0)
+    const pendingAmount = Number(notes.pendingAmount || 0)
+    const ultraPriority = notes.ultraPriority === "yes"
+
+    const normalizedEmail = String(customer.email || "").trim().toLowerCase()
+
+    const normalizedPaymentType =
+      paymentType === "PREPAID" ? "PREPAID" : "ADVANCE"
 
     const { error: dbError } = await supabase.from("orders").insert([
       {
-        razorpay_order_id: orderId,
-        razorpay_payment_id: paymentId,
+        razorpay_order_id,
+        razorpay_payment_id,
         edition,
         payment_type: normalizedPaymentType,
-        amount,
-        name: shipping.name,
+        amount: amountToPay,
+        name: customer.name,
         email: normalizedEmail,
-        phone: shipping.phone,
-        address: shipping.address,
+        phone: customer.phone,
+        address: customer.address,
       },
     ])
 
-    if (dbError) console.error("⚠️ Supabase insert failed:", dbError)
-    else console.log("✅ Order saved to Supabase:", orderId)
+    if (dbError) {
+      console.error("⚠️ Supabase insert failed:", dbError)
+      return res.status(500).json({
+        error: "Payment verified but failed to save order",
+        details: dbError,
+      })
+    }
 
-    // Admin email (don’t break checkout if it fails)
+    console.log("✅ Order saved to Supabase:", razorpay_order_id)
+
     try {
-      const r = await resend.emails.send({
+      await resend.emails.send({
         from: EMAIL_FROM,
         to: [ADMIN_EMAIL],
         subject: `🖤 New Order Confirmed – ${edition}`,
@@ -256,29 +342,38 @@ app.post("/confirm-payment", async (req, res) => {
           <h2>New Order Confirmed</h2>
           <p><strong>Edition:</strong> ${edition}</p>
           <p><strong>Payment Type:</strong> ${
-            normalizedPaymentType === "PREPAID"
-              ? "Paid in full"
-              : "COD (Advance Paid)"
+            normalizedPaymentType === "PREPAID" ? "Paid in full" : "50% Advance"
           }</p>
-          <p><strong>Amount Paid:</strong> ₹${amount}</p>
-          <p><strong>Razorpay Payment ID:</strong> ${paymentId}</p>
-          <p><strong>Order ID:</strong> ${orderId}</p>
+          <p><strong>Amount Paid:</strong> ₹${amountToPay}</p>
+          <p><strong>Total Order Value:</strong> ₹${totalOrderValue}</p>
+          <p><strong>Pending Amount:</strong> ₹${pendingAmount}</p>
+          <p><strong>Ultra Priority:</strong> ${ultraPriority ? "Yes" : "No"}</p>
+          <p><strong>Razorpay Payment ID:</strong> ${razorpay_payment_id}</p>
+          <p><strong>Razorpay Order ID:</strong> ${razorpay_order_id}</p>
           <hr />
-          <p><strong>Name:</strong> ${shipping.name}</p>
-          <p><strong>Phone:</strong> ${shipping.phone}</p>
-          <p><strong>Email:</strong> ${shipping.email || "-"}</p>
-          <p><strong>Address:</strong><br/>${shipping.address}</p>
+          <p><strong>Name:</strong> ${customer.name}</p>
+          <p><strong>Phone:</strong> ${customer.phone}</p>
+          <p><strong>Email:</strong> ${normalizedEmail}</p>
+          <p><strong>Address:</strong><br/>${customer.address}</p>
         `,
       })
-      console.log("📨 Admin email sent:", r?.id || r)
-    } catch (e) {
-      console.error("❌ Resend admin email failed:", safeErr(e))
+
+      console.log("📨 Admin order email sent")
+    } catch (emailErr) {
+      console.error("❌ Admin email failed:", safeErr(emailErr))
     }
 
-    return res.json({ success: true })
+    return res.json({
+      success: true,
+      nextUrl: `/story/submit?order=${razorpay_order_id}`,
+      razorpayOrderId: razorpay_order_id,
+    })
   } catch (err) {
-    console.error("❌ Confirmation error:", err)
-    return res.json({ success: true })
+    console.error("❌ /confirm-payment error:", safeErr(err))
+    return res.status(500).json({
+      error: "Payment confirmation failed",
+      details: safeErr(err),
+    })
   }
 })
 
@@ -340,7 +435,6 @@ app.post("/send-portal-link", async (req, res) => {
       </div>
     `
 
-    // 1) Try sending to the customer
     try {
       const r = await resend.emails.send({
         from: EMAIL_FROM,
@@ -348,14 +442,18 @@ app.post("/send-portal-link", async (req, res) => {
         subject: "Your SoulScript Legacy writing link",
         html,
       })
-      console.log("📨 Portal email sent to customer:", normalizedEmail, r?.id || r)
+
+      console.log(
+        "📨 Portal email sent to customer:",
+        normalizedEmail,
+        r?.id || r
+      )
+
       return res.json({ success: true, portalUrl })
     } catch (e) {
       const err = safeErr(e)
       console.error("❌ Resend portal email failed (customer):", err)
 
-      // 2) If Resend blocks (usually 403 during pending domain / test mode),
-      // fallback send to ADMIN so flow doesn't block development.
       try {
         const r2 = await resend.emails.send({
           from: EMAIL_FROM,
@@ -368,23 +466,29 @@ app.post("/send-portal-link", async (req, res) => {
             ${html}
           `,
         })
-        console.log("📨 Portal email fallback sent to admin:", ADMIN_EMAIL, r2?.id || r2)
+
+        console.log(
+          "📨 Portal email fallback sent to admin:",
+          ADMIN_EMAIL,
+          r2?.id || r2
+        )
 
         return res.json({
           success: true,
           portalUrl,
           warning:
-            "Resend blocked sending to customer (domain pending/test mode). Sent fallback to admin email instead.",
+            "Resend blocked sending to customer. Sent fallback to admin email instead.",
           resend_error: err,
         })
       } catch (e2) {
         const err2 = safeErr(e2)
         console.error("❌ Resend portal email failed (admin fallback):", err2)
+
         return res.status(500).json({
           error: "Email sending failed (Resend).",
           resend_error_customer: err,
           resend_error_admin: err2,
-          portalUrl, // still return so you can keep moving
+          portalUrl,
         })
       }
     }
@@ -489,7 +593,6 @@ app.post("/submit-story", async (req, res) => {
       return res.status(500).json({ error: "Failed to save story" })
     }
 
-    // Admin email (don’t break customer UX)
     try {
       const r = await resend.emails.send({
         from: EMAIL_FROM,
@@ -501,7 +604,7 @@ app.post("/submit-story", async (req, res) => {
           <p><strong>Payment Type:</strong> ${
             order.payment_type === "PREPAID"
               ? "Paid in full"
-              : "COD (Advance Paid)"
+              : "50% Advance"
           }</p>
           <hr />
           <p><strong>Name:</strong> ${order.name}</p>
@@ -512,6 +615,7 @@ app.post("/submit-story", async (req, res) => {
           <pre style="white-space: pre-wrap; font-family: serif;">${story}</pre>
         `,
       })
+
       console.log("📨 Story email sent:", r?.id || r)
     } catch (e) {
       console.error("❌ Resend story email failed:", safeErr(e))
@@ -520,7 +624,7 @@ app.post("/submit-story", async (req, res) => {
     return res.json({ success: true, story_submitted: true })
   } catch (err) {
     console.error("❌ Submit story error:", safeErr(err))
-    return res.json({ success: true })
+    return res.status(500).json({ error: "Submit story error" })
   }
 })
 
@@ -528,6 +632,7 @@ app.post("/submit-story", async (req, res) => {
    START SERVER
 ========================= */
 const PORT = process.env.PORT || 3000
+
 app.listen(PORT, () => {
   console.log(`✅ Server running on port ${PORT}`)
   console.log(`✅ PORTAL_BASE_URL = ${PORTAL_BASE_URL}`)
