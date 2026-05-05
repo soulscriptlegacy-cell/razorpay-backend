@@ -26,7 +26,54 @@ app.use(
 )
 
 app.use(express.json({ limit: "2mb" }))
+/* =========================
+   CUSTOMER ACCOUNT HELPERS
+========================= */
 
+const ACCOUNT_SESSION_DAYS = 180
+
+function normalizeEmail(email) {
+  return String(email || "").trim().toLowerCase()
+}
+
+function createToken(bytes = 32) {
+  return crypto.randomBytes(bytes).toString("hex")
+}
+
+async function getCustomerFromSession(req) {
+  const authHeader = String(req.header("Authorization") || "")
+
+  if (!authHeader.startsWith("Bearer ")) {
+    return { error: "Missing account session", status: 401 }
+  }
+
+  const sessionToken = authHeader.replace("Bearer ", "").trim()
+
+  if (!sessionToken) {
+    return { error: "Missing account session", status: 401 }
+  }
+
+  const { data: session, error } = await supabase
+    .from("customer_sessions")
+    .select("*")
+    .eq("session_token", sessionToken)
+    .eq("revoked", false)
+    .single()
+
+  if (error || !session) {
+    return { error: "Invalid or expired account session", status: 401 }
+  }
+
+  await supabase
+    .from("customer_sessions")
+    .update({ last_seen_at: new Date().toISOString() })
+    .eq("id", session.id)
+
+  return {
+    email: normalizeEmail(session.email),
+    session,
+  }
+}
 /* =========================
    HELPERS
 ========================= */
@@ -402,6 +449,231 @@ nextUrl: `/story?order=${razorpay_order_id}`,
       error: "Payment confirmation failed",
       details: safeErr(err),
     })
+  }
+})
+
+/* =========================
+   CUSTOMER ACCOUNT LOGIN
+========================= */
+
+app.post("/account/send-login-link", async (req, res) => {
+  try {
+    const email = normalizeEmail(req.body?.email)
+
+    if (!email || !email.includes("@")) {
+      return res.status(400).json({ error: "Valid email required" })
+    }
+
+    const { data: existingOrders, error: orderCheckErr } = await supabase
+      .from("orders")
+      .select("id")
+      .eq("email", email)
+      .limit(1)
+
+    if (orderCheckErr) {
+      console.error("❌ Failed to check customer orders:", orderCheckErr)
+      return res.status(500).json({ error: "Could not check account" })
+    }
+
+    if (!existingOrders || existingOrders.length === 0) {
+      return res.status(404).json({
+        error: "No orders found with this email. Please use the email entered during checkout.",
+      })
+    }
+
+    const token = createToken(32)
+    const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString()
+
+    const { error: tokenErr } = await supabase
+      .from("customer_login_tokens")
+      .insert({
+        email,
+        token,
+        expires_at: expiresAt,
+        used: false,
+      })
+
+    if (tokenErr) {
+      console.error("❌ Failed to create account login token:", tokenErr)
+      return res.status(500).json({ error: "Could not create login link" })
+    }
+
+    const loginUrl = `${PORTAL_BASE_URL}/account-login?token=${token}`
+
+    const html = `
+      <div style="font-family: Inter, Arial, sans-serif; line-height:1.6;">
+        <p>Hi,</p>
+        <p>Use the button below to access your SoulScript Legacy account.</p>
+
+        <p>
+          <a href="${loginUrl}" style="display:inline-block;padding:12px 16px;background:#000;color:#fff;text-decoration:none;border-radius:10px;">
+            Open My Account
+          </a>
+        </p>
+
+        <p style="color:#555;font-size:13px;">
+          This login link expires in 30 minutes. Once opened, your account will stay logged in on this browser unless you log out.
+        </p>
+
+        <p>— SoulScript Legacy</p>
+      </div>
+    `
+
+    try {
+      const r = await resend.emails.send({
+        from: EMAIL_FROM,
+        to: [email],
+        subject: "Your SoulScript Legacy account login",
+        html,
+      })
+
+      console.log("📨 Account login email sent:", email, r?.id || r)
+
+      return res.json({
+        success: true,
+        message: "Account login link sent",
+      })
+    } catch (emailErr) {
+      console.error("❌ Account login email failed:", safeErr(emailErr))
+
+      return res.status(500).json({
+        error: "Could not send account login email",
+        details: safeErr(emailErr),
+      })
+    }
+  } catch (err) {
+    console.error("❌ /account/send-login-link error:", safeErr(err))
+    return res.status(500).json({ error: "Server error" })
+  }
+})
+
+app.get("/account/verify-login", async (req, res) => {
+  try {
+    const token = String(req.query.token || "").trim()
+
+    if (!token) {
+      return res.status(400).json({ error: "Login token missing" })
+    }
+
+    const { data: loginToken, error: tokenErr } = await supabase
+      .from("customer_login_tokens")
+      .select("*")
+      .eq("token", token)
+      .eq("used", false)
+      .single()
+
+    if (tokenErr || !loginToken) {
+      return res.status(401).json({ error: "Invalid or already used login link" })
+    }
+
+    if (new Date(loginToken.expires_at).getTime() < Date.now()) {
+      return res.status(410).json({ error: "Login link expired" })
+    }
+
+    const email = normalizeEmail(loginToken.email)
+    const sessionToken = createToken(40)
+
+    const { error: sessionErr } = await supabase
+      .from("customer_sessions")
+      .insert({
+        email,
+        session_token: sessionToken,
+        revoked: false,
+      })
+
+    if (sessionErr) {
+      console.error("❌ Failed to create customer session:", sessionErr)
+      return res.status(500).json({ error: "Could not create account session" })
+    }
+
+    await supabase
+      .from("customer_login_tokens")
+      .update({ used: true })
+      .eq("id", loginToken.id)
+
+    return res.json({
+      success: true,
+      email,
+      sessionToken,
+      expiresInDays: ACCOUNT_SESSION_DAYS,
+    })
+  } catch (err) {
+    console.error("❌ /account/verify-login error:", safeErr(err))
+    return res.status(500).json({ error: "Server error" })
+  }
+})
+
+app.get("/account/me", async (req, res) => {
+  try {
+    const customer = await getCustomerFromSession(req)
+
+    if (customer.error) {
+      return res.status(customer.status || 401).json({ error: customer.error })
+    }
+
+    return res.json({
+      success: true,
+      email: customer.email,
+    })
+  } catch (err) {
+    console.error("❌ /account/me error:", safeErr(err))
+    return res.status(500).json({ error: "Server error" })
+  }
+})
+
+app.get("/account/orders", async (req, res) => {
+  try {
+    const customer = await getCustomerFromSession(req)
+
+    if (customer.error) {
+      return res.status(customer.status || 401).json({ error: customer.error })
+    }
+
+    const { data: orders, error: ordersErr } = await supabase
+      .from("orders")
+      .select(
+        "id, razorpay_order_id, edition, payment_type, amount, name, phone, email, address, created_at, story_submitted"
+      )
+      .eq("email", customer.email)
+      .order("created_at", { ascending: false })
+
+    if (ordersErr) {
+      console.error("❌ Failed to fetch account orders:", ordersErr)
+      return res.status(500).json({ error: "Failed to fetch orders" })
+    }
+
+    return res.json({
+      success: true,
+      email: customer.email,
+      orders: orders || [],
+    })
+  } catch (err) {
+    console.error("❌ /account/orders error:", safeErr(err))
+    return res.status(500).json({ error: "Server error" })
+  }
+})
+
+app.post("/account/logout", async (req, res) => {
+  try {
+    const authHeader = String(req.header("Authorization") || "")
+
+    if (!authHeader.startsWith("Bearer ")) {
+      return res.json({ success: true })
+    }
+
+    const sessionToken = authHeader.replace("Bearer ", "").trim()
+
+    if (sessionToken) {
+      await supabase
+        .from("customer_sessions")
+        .update({ revoked: true })
+        .eq("session_token", sessionToken)
+    }
+
+    return res.json({ success: true })
+  } catch (err) {
+    console.error("❌ /account/logout error:", safeErr(err))
+    return res.status(500).json({ error: "Server error" })
   }
 })
 
