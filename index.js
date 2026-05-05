@@ -123,6 +123,34 @@ function calculateCheckoutAmount({ edition, paymentType, ultraPriority }) {
 }
 
 /* =========================
+   PRICING QUOTE (no order created)
+========================= */
+app.post("/quote", (req, res) => {
+  try {
+    const { edition, paymentType = "PREPAID", ultraPriority = false } = req.body
+
+    if (!edition) {
+      return res.status(400).json({ error: "Edition required" })
+    }
+
+    const pricing = calculateCheckoutAmount({
+      edition,
+      paymentType,
+      ultraPriority: !!ultraPriority,
+    })
+
+    return res.json({
+      success: true,
+      ...pricing,
+      ultraPriorityPrice: ULTRA_PRIORITY_PRICE,
+    })
+  } catch (err) {
+    console.error("❌ /quote failed:", safeErr(err))
+    return res.status(400).json({ error: err?.message || "Quote failed" })
+  }
+})
+
+/* =========================
    HEALTH CHECK
 ========================= */
 app.get("/health", (req, res) => {
