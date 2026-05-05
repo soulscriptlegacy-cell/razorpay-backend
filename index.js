@@ -676,7 +676,101 @@ app.post("/account/logout", async (req, res) => {
     return res.status(500).json({ error: "Server error" })
   }
 })
+/* =========================
+   CUSTOMER PROFILE FROM ORDERS
+========================= */
 
+app.get("/account/profile", async (req, res) => {
+  try {
+    const customer = await getCustomerFromSession(req)
+
+    if (customer.error) {
+      return res.status(customer.status || 401).json({ error: customer.error })
+    }
+
+    const { data: latestOrder, error } = await supabase
+      .from("orders")
+      .select("name, phone, email, address")
+      .eq("email", customer.email)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .single()
+
+    if (error || !latestOrder) {
+      return res.status(404).json({ error: "No profile found for this account" })
+    }
+
+    return res.json({
+      success: true,
+      profile: {
+        name: latestOrder.name || "",
+        phone: latestOrder.phone || "",
+        email: latestOrder.email || customer.email,
+        address: latestOrder.address || "",
+        location: "India",
+      },
+    })
+  } catch (err) {
+    console.error("❌ /account/profile error:", safeErr(err))
+    return res.status(500).json({ error: "Server error" })
+  }
+})
+
+app.post("/account/profile", async (req, res) => {
+  try {
+    const customer = await getCustomerFromSession(req)
+
+    if (customer.error) {
+      return res.status(customer.status || 401).json({ error: customer.error })
+    }
+
+    const name = String(req.body?.name || "").trim()
+    const phone = String(req.body?.phone || "").trim()
+    const address = String(req.body?.address || "").trim()
+
+    if (!name) {
+      return res.status(400).json({ error: "Name is required" })
+    }
+
+    if (!phone || phone.length < 8) {
+      return res.status(400).json({ error: "Valid phone number is required" })
+    }
+
+    if (!address) {
+      return res.status(400).json({ error: "Address is required" })
+    }
+
+    const { data, error } = await supabase
+      .from("orders")
+      .update({
+        name,
+        phone,
+        address,
+      })
+      .eq("email", customer.email)
+      .select("id, name, phone, email, address")
+    
+    if (error) {
+      console.error("❌ Failed to update account profile:", error)
+      return res.status(500).json({ error: "Failed to update profile" })
+    }
+
+    return res.json({
+      success: true,
+      updatedOrders: data?.length || 0,
+      profile: {
+        name,
+        phone,
+        email: customer.email,
+        address,
+        location: "India",
+      },
+    })
+  } catch (err) {
+    console.error("❌ /account/profile update error:", safeErr(err))
+    return res.status(500).json({ error: "Server error" })
+  }
+})
 /* =========================
    CUSTOMER MY ORDERS
 ========================= */
