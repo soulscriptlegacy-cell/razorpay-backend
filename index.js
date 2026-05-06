@@ -1397,6 +1397,71 @@ app.post("/story/register-voice-note", async (req, res) => {
   }
 })
 
+app.post("/story/delete-voice-note", async (req, res) => {
+  try {
+    const { orderId, voiceNoteId } = req.body
+
+    if (!orderId || !voiceNoteId) {
+      return res.status(400).json({ error: "orderId and voiceNoteId are required" })
+    }
+
+    const order = await getOrderByIdOrRazorpay(orderId)
+
+    if (!order) {
+      return res.status(404).json({ error: "Order not found" })
+    }
+
+    if (order.story_submitted) {
+      return res.status(403).json({
+        error: "Story has already been submitted. Voice notes cannot be deleted now.",
+      })
+    }
+
+    const { data: voiceNote, error: voiceNoteErr } = await supabase
+      .from("voice_notes")
+      .select("*")
+      .eq("id", voiceNoteId)
+      .eq("order_id", order.id)
+      .single()
+
+    if (voiceNoteErr || !voiceNote) {
+      console.error("❌ Voice note not found for delete:", voiceNoteErr)
+      return res.status(404).json({ error: "Voice note not found" })
+    }
+
+    if (voiceNote.file_path) {
+      const { error: storageErr } = await supabase.storage
+        .from("order_voice_notes")
+        .remove([voiceNote.file_path])
+
+      if (storageErr) {
+        console.error("⚠️ Voice note storage delete failed:", storageErr)
+        // We still continue and delete DB row, because broken storage rows should not trap the customer.
+      }
+    }
+
+    const { error: deleteErr } = await supabase
+      .from("voice_notes")
+      .delete()
+      .eq("id", voiceNote.id)
+      .eq("order_id", order.id)
+
+    if (deleteErr) {
+      console.error("❌ Voice note DB delete failed:", deleteErr)
+      return res.status(500).json({ error: "Could not delete voice note" })
+    }
+
+    return res.json({
+      success: true,
+      deletedVoiceNoteId: voiceNote.id,
+      deletedFilePath: voiceNote.file_path || null,
+    })
+  } catch (err) {
+    console.error("❌ /story/delete-voice-note error:", safeErr(err))
+    return res.status(500).json({ error: "Voice note delete failed" })
+  }
+})
+
 app.post("/story/submit-intake", async (req, res) => {
   try {
     const {
