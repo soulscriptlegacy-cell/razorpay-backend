@@ -330,26 +330,37 @@ async function refreshOrderTotals(orderId) {
 /* =========================
    STORY INTAKE DRAFT HELPERS
 ========================= */
-async function getLatestStoryIntake(orderId) {
+async function getStoryIntakesForOrder(orderId) {
   const { data, error } = await supabase
     .from("story_intakes")
     .select("*")
     .eq("order_id", orderId)
-    .order("submitted_at", { ascending: false, nullsFirst: true })
-    .limit(1)
+    .order("created_at", { ascending: false })
 
   if (error) {
-    console.error("❌ getLatestStoryIntake failed:", error)
-    return null
+    console.error("❌ getStoryIntakesForOrder failed:", error)
+    return []
   }
 
-  return data?.[0] || null
+  return data || []
+}
+
+async function getActiveStoryIntake(orderId) {
+  const intakes = await getStoryIntakesForOrder(orderId)
+
+  if (!intakes.length) return null
+
+  const draft = intakes.find((item) => !item.submitted_at)
+  if (draft) return draft
+
+  return intakes[0] || null
 }
 
 async function upsertStoryIntakeDraft(order, draft = {}) {
-  const existingIntake = await getLatestStoryIntake(order.id)
+  const existingIntake = await getActiveStoryIntake(order.id)
 
-  const fallbackStory = draft.textStory ?? order.story ?? existingIntake?.text_story ?? ""
+  const fallbackStory =
+    draft.textStory ?? order.story ?? existingIntake?.text_story ?? ""
   const cleanStory = normalizeText(fallbackStory, 80000)
 
   const payload = {
@@ -363,17 +374,27 @@ async function upsertStoryIntakeDraft(order, draft = {}) {
     tone:
       normalizeText(draft.tone ?? existingIntake?.tone ?? "", 120) || null,
     note_to_writer:
-      normalizeText(draft.noteToWriter ?? existingIntake?.note_to_writer ?? "", 3500) || null,
+      normalizeText(
+        draft.noteToWriter ?? existingIntake?.note_to_writer ?? "",
+        3500
+      ) || null,
     cover_type:
-      normalizeText(draft.coverType ?? existingIntake?.cover_type ?? "", 80) || null,
+      normalizeText(draft.coverType ?? existingIntake?.cover_type ?? "", 80) ||
+      null,
     cover_notes:
-      normalizeText(draft.coverNotes ?? existingIntake?.cover_notes ?? "", 3500) || null,
+      normalizeText(draft.coverNotes ?? existingIntake?.cover_notes ?? "", 3500) ||
+      null,
     cover_title:
-      normalizeText(draft.coverTitle ?? existingIntake?.cover_title ?? "", 300) || null,
+      normalizeText(draft.coverTitle ?? existingIntake?.cover_title ?? "", 300) ||
+      null,
     author_name:
-      normalizeText(draft.authorName ?? existingIntake?.author_name ?? "", 180) || null,
+      normalizeText(draft.authorName ?? existingIntake?.author_name ?? "", 180) ||
+      null,
     photo_path:
-      normalizeText(draft.coverPhotoPath ?? existingIntake?.photo_path ?? "", 1200) || null,
+      normalizeText(
+        draft.coverPhotoPath ?? existingIntake?.photo_path ?? "",
+        1200
+      ) || null,
     reference_image_paths: Array.isArray(draft.referenceImagePaths)
       ? draft.referenceImagePaths.slice(0, 3)
       : existingIntake?.reference_image_paths || [],
@@ -384,7 +405,7 @@ async function upsertStoryIntakeDraft(order, draft = {}) {
       ) || null,
   }
 
-  if (existingIntake) {
+  if (existingIntake && !existingIntake.submitted_at) {
     const { data, error } = await supabase
       .from("story_intakes")
       .update(payload)
@@ -1222,7 +1243,7 @@ app.get("/portal-order", async (req, res) => {
     }
 
     const [storyIntakeRes, voiceNotesRes, callBookingsRes, deliverablesRes, revisionsRes, addonsRes] = await Promise.all([
-      supabase.from("story_intakes").select("*").eq("order_id", order.id).order("submitted_at", { ascending: false, nullsFirst: true }),
+      supabase.from("story_intakes").select("*").eq("order_id", order.id).order("created_at", { ascending: false }),
       supabase.from("voice_notes").select("*").eq("order_id", order.id).order("created_at", { ascending: false }),
       supabase.from("call_bookings").select("*").eq("order_id", order.id).order("created_at", { ascending: false }),
       supabase.from("deliverables").select("*").eq("order_id", order.id).order("uploaded_at", { ascending: false }),
@@ -1235,11 +1256,13 @@ app.get("/portal-order", async (req, res) => {
       return res.redirect(302, target)
     }
 
+    const activeStoryIntake = await getActiveStoryIntake(order.id)
+
     return res.json({
       success: true,
       order: {
         ...order,
-        story_intake: storyIntakeRes.data?.[0] || null,
+        story_intake: activeStoryIntake,
         story_intakes: storyIntakeRes.data || [],
         voice_notes: voiceNotesRes.data || [],
         call_bookings: callBookingsRes.data || [],
@@ -2213,7 +2236,7 @@ app.get("/admin/orders/:id", requireAdmin, adminAsync(async (req, res) => {
   }
 
   const [storyIntakesResult, voiceNotesResult, callBookingsResult, deliverablesResult, revisionsResult, addonsResult] = await Promise.all([
-    supabase.from("story_intakes").select("*").eq("order_id", id).order("submitted_at", { ascending: false, nullsFirst: true }),
+    supabase.from("story_intakes").select("*").eq("order_id", id).order("created_at", { ascending: false }),
     supabase.from("voice_notes").select("*").eq("order_id", id).order("created_at", { ascending: false }),
     supabase.from("call_bookings").select("*").eq("order_id", id).order("created_at", { ascending: false }),
     supabase.from("deliverables").select("*").eq("order_id", id).order("uploaded_at", { ascending: false }),
@@ -2226,11 +2249,13 @@ app.get("/admin/orders/:id", requireAdmin, adminAsync(async (req, res) => {
   if (relatedError) return adminHandleSupabaseError(res, relatedError.error, "Unable to load related order data.")
 
   const storyIntakes = storyIntakesResult.data || []
+  const activeStoryIntake = await getActiveStoryIntake(id)
+
   return res.json({
     success: true,
     order: {
       ...orderResult.data,
-      story_intake: storyIntakes[0] || null,
+      story_intake: activeStoryIntake,
       story_intakes: storyIntakes,
       voice_notes: voiceNotesResult.data || [],
       call_bookings: callBookingsResult.data || [],
@@ -2266,7 +2291,7 @@ app.patch("/admin/orders/:id", requireAdmin, adminAsync(async (req, res) => {
 }))
 
 app.get("/admin/story-intakes", requireAdmin, adminAsync(async (req, res) => {
-  const { data, error } = await supabase.from("story_intakes").select("*").order("submitted_at", { ascending: false, nullsFirst: true })
+  const { data, error } = await supabase.from("story_intakes").select("*").order("created_at", { ascending: false })
   if (error) return adminHandleSupabaseError(res, error, "Unable to load story intakes.")
   return res.json({ success: true, story_intakes: data || [] })
 }))
