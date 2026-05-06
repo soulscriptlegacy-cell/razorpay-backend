@@ -63,6 +63,15 @@ function createOtp() {
   return String(crypto.randomInt(100000, 1000000))
 }
 
+function escapeHtml(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;")
+}
+
 function hashOtp(email, otp) {
   const secret =
     process.env.OTP_SECRET ||
@@ -488,8 +497,9 @@ async function sendAccountOtpForEmail(email, res) {
 
   const { data: existingOrders, error: orderCheckErr } = await supabase
     .from("orders")
-    .select("id")
+    .select("id, name")
     .eq("email", cleanEmail)
+    .order("created_at", { ascending: false })
     .limit(1)
 
   if (orderCheckErr) {
@@ -502,6 +512,11 @@ async function sendAccountOtpForEmail(email, res) {
       error: "No orders found with this email. Please use the email entered during checkout.",
     })
   }
+
+  const customerName =
+    String(existingOrders?.[0]?.name || "").trim() || "SoulScript customer"
+
+  const safeCustomerName = escapeHtml(customerName)
 
   const otp = createOtp()
   const otpHash = hashOtp(cleanEmail, otp)
@@ -563,7 +578,7 @@ async function sendAccountOtpForEmail(email, res) {
                           </div>
 
                           <div style="font-size:16px;line-height:1.7;color:#111111;margin:0 0 26px;">
-                            Dear SoulScript customer,
+                            Dear ${safeCustomerName},
                           </div>
 
                           <div style="font-size:16px;line-height:1.7;color:#111111;margin:0 0 12px;">
