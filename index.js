@@ -328,6 +328,96 @@ async function refreshOrderTotals(orderId) {
 }
 
 /* =========================
+   STORY INTAKE DRAFT HELPERS
+========================= */
+async function getLatestStoryIntake(orderId) {
+  const { data, error } = await supabase
+    .from("story_intakes")
+    .select("*")
+    .eq("order_id", orderId)
+    .order("submitted_at", { ascending: false, nullsFirst: true })
+    .limit(1)
+
+  if (error) {
+    console.error("❌ getLatestStoryIntake failed:", error)
+    return null
+  }
+
+  return data?.[0] || null
+}
+
+async function upsertStoryIntakeDraft(order, draft = {}) {
+  const existingIntake = await getLatestStoryIntake(order.id)
+
+  const fallbackStory = draft.textStory ?? order.story ?? existingIntake?.text_story ?? ""
+  const cleanStory = normalizeText(fallbackStory, 80000)
+
+  const payload = {
+    order_id: order.id,
+    text_story: cleanStory,
+    word_count: Number(
+      draft.wordCount ??
+        existingIntake?.word_count ??
+        cleanStory.split(/\s+/).filter(Boolean).length
+    ),
+    tone:
+      normalizeText(draft.tone ?? existingIntake?.tone ?? "", 120) || null,
+    note_to_writer:
+      normalizeText(draft.noteToWriter ?? existingIntake?.note_to_writer ?? "", 3500) || null,
+    cover_type:
+      normalizeText(draft.coverType ?? existingIntake?.cover_type ?? "", 80) || null,
+    cover_notes:
+      normalizeText(draft.coverNotes ?? existingIntake?.cover_notes ?? "", 3500) || null,
+    cover_title:
+      normalizeText(draft.coverTitle ?? existingIntake?.cover_title ?? "", 300) || null,
+    author_name:
+      normalizeText(draft.authorName ?? existingIntake?.author_name ?? "", 180) || null,
+    photo_path:
+      normalizeText(draft.coverPhotoPath ?? existingIntake?.photo_path ?? "", 1200) || null,
+    reference_image_paths: Array.isArray(draft.referenceImagePaths)
+      ? draft.referenceImagePaths.slice(0, 3)
+      : existingIntake?.reference_image_paths || [],
+    essence_input_choice:
+      normalizeText(
+        draft.essenceInputChoice ?? existingIntake?.essence_input_choice ?? "",
+        40
+      ) || null,
+  }
+
+  if (existingIntake) {
+    const { data, error } = await supabase
+      .from("story_intakes")
+      .update(payload)
+      .eq("id", existingIntake.id)
+      .select("*")
+      .single()
+
+    if (error) {
+      console.error("❌ Story intake draft update failed:", error)
+      throw new Error("Could not save intake draft")
+    }
+
+    return data
+  }
+
+  const { data, error } = await supabase
+    .from("story_intakes")
+    .insert({
+      ...payload,
+      submitted_at: null,
+    })
+    .select("*")
+    .single()
+
+  if (error) {
+    console.error("❌ Story intake draft insert failed:", error)
+    throw new Error("Could not create intake draft")
+  }
+
+  return data
+}
+
+/* =========================
    PRICING QUOTE
 ========================= */
 app.post("/quote", (req, res) => {
@@ -1132,7 +1222,7 @@ app.get("/portal-order", async (req, res) => {
     }
 
     const [storyIntakeRes, voiceNotesRes, callBookingsRes, deliverablesRes, revisionsRes, addonsRes] = await Promise.all([
-      supabase.from("story_intakes").select("*").eq("order_id", order.id).order("submitted_at", { ascending: false }),
+      supabase.from("story_intakes").select("*").eq("order_id", order.id).order("submitted_at", { ascending: false, nullsFirst: true }),
       supabase.from("voice_notes").select("*").eq("order_id", order.id).order("created_at", { ascending: false }),
       supabase.from("call_bookings").select("*").eq("order_id", order.id).order("created_at", { ascending: false }),
       supabase.from("deliverables").select("*").eq("order_id", order.id).order("uploaded_at", { ascending: false }),
@@ -1314,6 +1404,53 @@ app.post("/story/confirm-addon-payment", async (req, res) => {
     return res.status(500).json({ error: "Add-on payment confirmation failed" })
   }
 })
+
+app.post("/story/save-intake-draft", async (req, res) => {
+  try {
+    const {
+      orderId,
+      coverTitle,
+      authorName,
+      coverNotes,
+      noteToWriter,
+      tone,
+      coverType,
+      coverPhotoPath,
+      referenceImagePaths = [],
+      essenceInputChoice,
+    } = req.body
+
+    const order = await getOrderByIdOrRazorpay(orderId)
+    if (!order) return res.status(404).json({ error: "Order not found" })
+
+    if (order.story_submitted) {
+      return res.json({ success: true, locked: true })
+    }
+
+    const story_intake = await upsertStoryIntakeDraft(order, {
+      coverTitle,
+      authorName,
+      coverNotes,
+      noteToWriter,
+      tone,
+      coverType,
+      coverPhotoPath,
+      referenceImagePaths,
+      essenceInputChoice,
+    })
+
+    return res.json({
+      success: true,
+      story_intake,
+    })
+  } catch (err) {
+    console.error("❌ /story/save-intake-draft error:", safeErr(err))
+    return res.status(500).json({
+      error: err?.message || "Intake draft save failed",
+    })
+  }
+})
+
 app.post("/story/save-cover-photo", async (req, res) => {
   try {
     const { orderId, photoPath } = req.body
@@ -1321,60 +1458,25 @@ app.post("/story/save-cover-photo", async (req, res) => {
     const order = await getOrderByIdOrRazorpay(orderId)
     if (!order) return res.status(404).json({ error: "Order not found" })
 
+    if (order.story_submitted) {
+      return res.json({ success: true, locked: true })
+    }
+
     if (!photoPath) {
       return res.status(400).json({ error: "photoPath required" })
     }
 
-    const existing = await supabase
-      .from("story_intakes")
-      .select("id")
-      .eq("order_id", order.id)
-      .order("submitted_at", { ascending: false })
-      .limit(1)
+    const story_intake = await upsertStoryIntakeDraft(order, {
+      coverPhotoPath: photoPath,
+    })
 
-    const existingIntake = existing.data?.[0]
-
-    if (existingIntake) {
-      const { data, error } = await supabase
-        .from("story_intakes")
-        .update({
-          photo_path: photoPath,
-        })
-        .eq("id", existingIntake.id)
-        .select("*")
-        .single()
-
-      if (error) {
-        console.error("❌ Cover photo save failed:", error)
-        return res.status(500).json({ error: "Could not save cover photo" })
-      }
-
-      return res.json({ success: true, story_intake: data })
-    }
-
-    const { data, error } = await supabase
-      .from("story_intakes")
-      .insert({
-        order_id: order.id,
-        photo_path: photoPath,
-        text_story: order.story || "",
-        word_count: 0,
-        submitted_at: null,
-      })
-      .select("*")
-      .single()
-
-    if (error) {
-      console.error("❌ Cover photo insert failed:", error)
-      return res.status(500).json({ error: "Could not save cover photo" })
-    }
-
-    return res.json({ success: true, story_intake: data })
+    return res.json({ success: true, story_intake })
   } catch (err) {
     console.error("❌ /story/save-cover-photo error:", safeErr(err))
     return res.status(500).json({ error: "Cover photo save failed" })
   }
 })
+
 app.post("/story/save-draft", async (req, res) => {
   try {
     const { orderId, story } = req.body
@@ -1496,7 +1598,6 @@ app.post("/story/delete-voice-note", async (req, res) => {
 
       if (storageErr) {
         console.error("⚠️ Voice note storage delete failed:", storageErr)
-        // We still continue and delete DB row, because broken storage rows should not trap the customer.
       }
     }
 
@@ -1550,28 +1651,31 @@ app.post("/story/submit-intake", async (req, res) => {
     const cleanCoverNotes = normalizeText(coverNotes, 3500)
     const cleanNoteToWriter = normalizeText(noteToWriter, 3500)
 
+    const intakeDraft = await upsertStoryIntakeDraft(order, {
+      textStory: cleanStory,
+      wordCount: Number(wordCount || cleanStory.split(/\s+/).filter(Boolean).length),
+      tone,
+      noteToWriter: cleanNoteToWriter,
+      coverType,
+      coverNotes: cleanCoverNotes,
+      coverTitle,
+      authorName,
+      coverPhotoPath,
+      referenceImagePaths,
+      essenceInputChoice,
+    })
+
     const { data: intake, error: intakeErr } = await supabase
       .from("story_intakes")
-      .insert({
-        order_id: order.id,
-        text_story: cleanStory,
-        word_count: Number(wordCount || cleanStory.split(/\s+/).filter(Boolean).length),
-        tone: tone || null,
-        note_to_writer: cleanNoteToWriter || null,
-        cover_type: coverType || null,
-        cover_notes: cleanCoverNotes || null,
-        cover_title: coverTitle || null,
-        author_name: authorName || null,
-        photo_path: coverPhotoPath || null,
-        reference_image_paths: referenceImagePaths || [],
-        essence_input_choice: essenceInputChoice || null,
+      .update({
         submitted_at: new Date().toISOString(),
       })
+      .eq("id", intakeDraft.id)
       .select("*")
       .single()
 
     if (intakeErr) {
-      console.error("❌ Story intake insert failed:", intakeErr)
+      console.error("❌ Story intake submit update failed:", intakeErr)
       return res.status(500).json({ error: "Failed to submit story intake" })
     }
 
@@ -2109,7 +2213,7 @@ app.get("/admin/orders/:id", requireAdmin, adminAsync(async (req, res) => {
   }
 
   const [storyIntakesResult, voiceNotesResult, callBookingsResult, deliverablesResult, revisionsResult, addonsResult] = await Promise.all([
-    supabase.from("story_intakes").select("*").eq("order_id", id).order("submitted_at", { ascending: false }),
+    supabase.from("story_intakes").select("*").eq("order_id", id).order("submitted_at", { ascending: false, nullsFirst: true }),
     supabase.from("voice_notes").select("*").eq("order_id", id).order("created_at", { ascending: false }),
     supabase.from("call_bookings").select("*").eq("order_id", id).order("created_at", { ascending: false }),
     supabase.from("deliverables").select("*").eq("order_id", id).order("uploaded_at", { ascending: false }),
@@ -2162,7 +2266,7 @@ app.patch("/admin/orders/:id", requireAdmin, adminAsync(async (req, res) => {
 }))
 
 app.get("/admin/story-intakes", requireAdmin, adminAsync(async (req, res) => {
-  const { data, error } = await supabase.from("story_intakes").select("*").order("submitted_at", { ascending: false })
+  const { data, error } = await supabase.from("story_intakes").select("*").order("submitted_at", { ascending: false, nullsFirst: true })
   if (error) return adminHandleSupabaseError(res, error, "Unable to load story intakes.")
   return res.json({ success: true, story_intakes: data || [] })
 }))
