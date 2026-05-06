@@ -2499,27 +2499,89 @@ app.post("/admin/orders/:id/send-story-reminder", requireAdmin, adminAsync(async
   }
 
   const portalUrl = `${PORTAL_BASE_URL}/story?order=${encodeURIComponent(order.razorpay_order_id)}`
-  const customerName = String(order.name || "").trim() || "there"
+  const customerName = String(order.name || "").trim() || "SoulScript customer"
+  const editionName = String(order.edition || "SoulScript Legacy edition").trim()
+
+  const html = `
+    <!doctype html>
+    <html>
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      </head>
+      <body style="margin:0;padding:0;background:#f3f3f3;font-family:Arial, Helvetica, sans-serif;color:#111111;">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#f3f3f3;margin:0;padding:0;">
+          <tr>
+            <td align="center" style="padding:42px 16px;">
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width:600px;background:#ffffff;margin:0 auto;color:#111111;">
+                <tr>
+                  <td align="center" style="padding:46px 38px 52px;background:#ffffff;color:#111111;">
+                    <div style="font-family:Georgia, 'Times New Roman', serif;font-size:20px;font-weight:500;letter-spacing:5px;color:#0E0E0E;line-height:1;text-transform:uppercase;">
+                      SOULSCRIPT
+                    </div>
+                    <div style="font-family:Arial, Helvetica, sans-serif;font-size:8.5px;font-weight:300;letter-spacing:5.5px;color:rgba(14,14,14,0.65);line-height:1;text-transform:uppercase;margin-top:7px;">
+                      LEGACY
+                    </div>
+
+                    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+                      <tr>
+                        <td style="padding-top:72px;text-align:left;background:#ffffff;color:#111111;">
+                          <div style="font-size:18px;line-height:1.4;font-weight:700;color:#111111;margin:0 0 46px;">
+                            Your story portal is waiting
+                          </div>
+
+                          <div style="font-size:16px;line-height:1.7;color:#111111;margin:0 0 26px;">
+                            Dear ${escapeHtml(customerName)},
+                          </div>
+
+                          <div style="font-size:16px;line-height:1.7;color:#111111;margin:0 0 18px;">
+                            This is a gentle reminder to complete your SoulScript Legacy story submission.
+                          </div>
+
+                          <div style="font-size:16px;line-height:1.7;color:#111111;margin:0 0 34px;">
+                            Your ${escapeHtml(editionName)} can move into the writing process once your story details are shared with us.
+                          </div>
+
+                          <div style="margin:0 0 38px;">
+                            <a href="${portalUrl}" target="_blank" style="display:inline-block;background:#0E0E0E;color:#ffffff;padding:13px 18px;text-decoration:none;font-size:13px;letter-spacing:0.4px;">
+                              Open Story Portal
+                            </a>
+                          </div>
+
+                          <div style="font-size:13px;line-height:1.7;color:#666666;margin:0 0 52px;">
+                            If the button does not open, copy this link into your browser:<br />
+                            <a href="${portalUrl}" target="_blank" style="color:#666666;text-decoration:underline;word-break:break-all;">
+                              ${portalUrl}
+                            </a>
+                          </div>
+
+                          <div style="font-size:16px;line-height:1.35;color:#111111;margin:0 0 82px;">
+                            Best regards,<br />
+                            SoulScript Legacy
+                          </div>
+
+                          <div style="font-size:13px;line-height:1.6;color:#8a8a8a;margin:0;">
+                            <a href="${PORTAL_BASE_URL}/privacy" target="_blank" style="color:#8a8a8a;text-decoration:underline;">PRIVACY POLICY</a>
+                            <span style="color:#8a8a8a;"> · </span>
+                            <a href="${PORTAL_BASE_URL}/terms" target="_blank" style="color:#8a8a8a;text-decoration:underline;">Terms and Conditions</a>
+                          </div>
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      </body>
+    </html>
+  `
 
   const sent = await sendEmailSafe({
     to: customerEmail,
     subject: "Complete your SoulScript Legacy story",
-    html: `
-      <div style="font-family: Arial, sans-serif; line-height:1.7;color:#111;">
-        <h2>Your story portal is waiting</h2>
-        <p>Dear ${escapeHtml(customerName)},</p>
-        <p>This is a gentle reminder to complete your SoulScript Legacy story submission.</p>
-        <p>Your ${escapeHtml(order.edition || "SoulScript Legacy edition")} can move into writing once your story details are shared.</p>
-        <p>
-          <a href="${portalUrl}" style="display:inline-block;background:#0E0E0E;color:#fff;padding:12px 16px;text-decoration:none;">
-            Open Story Portal
-          </a>
-        </p>
-        <p>If the button does not open, copy this link into your browser:</p>
-        <p style="word-break:break-all;color:#555;">${portalUrl}</p>
-        <p>Best regards,<br/>SoulScript Legacy</p>
-      </div>
-    `,
+    html,
   })
 
   if (!sent.ok) {
@@ -2538,6 +2600,7 @@ app.post("/admin/orders/:id/send-story-reminder", requireAdmin, adminAsync(async
     portalUrl,
   })
 }))
+
 
 
 
