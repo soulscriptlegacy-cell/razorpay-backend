@@ -102,6 +102,33 @@ function getRazorpayPublicKey() {
   return RAZORPAY_KEY_ID
 }
 
+function firstNonEmpty(...values) {
+  for (const value of values) {
+    if (value === undefined || value === null) continue
+    const text = String(value).trim()
+    if (text) return text
+  }
+  return ""
+}
+
+function normalizeStringArray(value, fallback = [], maxItems = 3) {
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => String(item || "").trim())
+      .filter(Boolean)
+      .slice(0, maxItems)
+  }
+
+  if (Array.isArray(fallback)) {
+    return fallback
+      .map((item) => String(item || "").trim())
+      .filter(Boolean)
+      .slice(0, maxItems)
+  }
+
+  return []
+}
+
 async function sendEmailSafe({ to, subject, html }) {
   try {
     const r = await resend.emails.send({
@@ -257,6 +284,7 @@ function getAddonAmount({ addonType, quantity = 1, customAmount }) {
   if (addonType === "extra_softcover_copy") return ADDON_PRICES.extra_softcover_copy * qty
   if (addonType === "extra_hardcover_copy") return ADDON_PRICES.extra_hardcover_copy * qty
   if (addonType === "extra_polaroids_pack") return ADDON_PRICES.extra_polaroids_pack * qty
+
   if (addonType === "revision_charge") {
     const amount = Number(customAmount || 0)
     if (!Number.isFinite(amount) || amount <= 0) {
@@ -264,6 +292,7 @@ function getAddonAmount({ addonType, quantity = 1, customAmount }) {
     }
     return amount
   }
+
   if (addonType === "balance_payment") {
     const amount = Number(customAmount || 0)
     if (!Number.isFinite(amount) || amount <= 0) {
@@ -350,7 +379,10 @@ async function getActiveStoryIntake(orderId) {
 
   if (!intakes.length) return null
 
-  const draft = intakes.find((item) => !item.submitted_at)
+  const draft = intakes.find(
+    (item) => item.submitted !== true && !item.submitted_at
+  )
+
   if (draft) return draft
 
   return intakes[0] || null
@@ -361,51 +393,112 @@ async function upsertStoryIntakeDraft(order, draft = {}) {
 
   const fallbackStory =
     draft.textStory ?? order.story ?? existingIntake?.text_story ?? ""
+
   const cleanStory = normalizeText(fallbackStory, 80000)
+
+  const incomingCoverPhotoPath =
+    draft.coverPhotoPath === undefined || draft.coverPhotoPath === null
+      ? undefined
+      : String(draft.coverPhotoPath).trim()
+
+  const coverPhotoPathToSave =
+    incomingCoverPhotoPath !== undefined
+      ? normalizeText(incomingCoverPhotoPath, 1200) || null
+      : existingIntake?.cover_photo_path || null
 
   const payload = {
     order_id: order.id,
+
     text_story: cleanStory,
+
     word_count: Number(
       draft.wordCount ??
         existingIntake?.word_count ??
         cleanStory.split(/\s+/).filter(Boolean).length
     ),
+
     tone:
-      normalizeText(draft.tone ?? existingIntake?.tone ?? "", 120) || null,
-    note_to_writer:
+      normalizeText(firstNonEmpty(draft.tone, existingIntake?.tone), 120) ||
+      null,
+
+    writer_note:
       normalizeText(
-        draft.noteToWriter ?? existingIntake?.note_to_writer ?? "",
+        firstNonEmpty(
+          draft.noteToWriter,
+          draft.writerNote,
+          existingIntake?.writer_note
+        ),
         3500
       ) || null,
-    cover_type:
-      normalizeText(draft.coverType ?? existingIntake?.cover_type ?? "", 80) ||
-      null,
-    cover_notes:
-      normalizeText(draft.coverNotes ?? existingIntake?.cover_notes ?? "", 3500) ||
-      null,
-    cover_title:
-      normalizeText(draft.coverTitle ?? existingIntake?.cover_title ?? "", 300) ||
-      null,
-    author_name:
-      normalizeText(draft.authorName ?? existingIntake?.author_name ?? "", 180) ||
-      null,
-    photo_path:
+
+    cover_mode:
       normalizeText(
-        draft.coverPhotoPath ?? existingIntake?.photo_path ?? "",
-        1200
+        firstNonEmpty(
+          draft.coverType,
+          draft.coverMode,
+          existingIntake?.cover_mode
+        ),
+        80
       ) || null,
-    reference_image_paths: Array.isArray(draft.referenceImagePaths)
-      ? draft.referenceImagePaths.slice(0, 3)
-      : existingIntake?.reference_image_paths || [],
-    essence_input_choice:
+
+    custom_cover_notes:
       normalizeText(
-        draft.essenceInputChoice ?? existingIntake?.essence_input_choice ?? "",
+        firstNonEmpty(
+          draft.coverNotes,
+          draft.customCoverNotes,
+          existingIntake?.custom_cover_notes
+        ),
+        3500
+      ) || null,
+
+    title:
+      normalizeText(
+        firstNonEmpty(draft.coverTitle, draft.title, existingIntake?.title),
+        300
+      ) || null,
+
+    author_name:
+      normalizeText(
+        firstNonEmpty(draft.authorName, existingIntake?.author_name),
+        180
+      ) || null,
+
+    cover_photo_path: coverPhotoPathToSave,
+
+    reference_image_paths: normalizeStringArray(
+      draft.referenceImagePaths,
+      existingIntake?.reference_image_paths,
+      3
+    ),
+
+    voice_choice:
+      normalizeText(
+        firstNonEmpty(
+          draft.essenceInputChoice,
+          draft.voiceChoice,
+          existingIntake?.voice_choice
+        ),
         40
       ) || null,
+
+    essence_input_choice:
+      normalizeText(
+        firstNonEmpty(
+          draft.essenceInputChoice,
+          draft.voiceChoice,
+          existingIntake?.essence_input_choice
+        ),
+        40
+      ) || null,
+
+    updated_at: new Date().toISOString(),
   }
 
-  if (existingIntake && !existingIntake.submitted_at) {
+  if (
+    existingIntake &&
+    existingIntake.submitted !== true &&
+    !existingIntake.submitted_at
+  ) {
     const { data, error } = await supabase
       .from("story_intakes")
       .update(payload)
@@ -425,6 +518,7 @@ async function upsertStoryIntakeDraft(order, draft = {}) {
     .from("story_intakes")
     .insert({
       ...payload,
+      submitted: false,
       submitted_at: null,
     })
     .select("*")
@@ -983,7 +1077,7 @@ app.get("/account/orders", async (req, res) => {
     const { data: orders, error: ordersErr } = await supabase
       .from("orders")
       .select(
-        "id, razorpay_order_id, edition, payment_type, amount, name, phone, email, address, created_at, story_submitted"
+        "id, razorpay_order_id, edition, payment_type, amount, name, phone, email, address, created_at, story_submitted, total_order_value, paid_amount, balance_due"
       )
       .eq("email", customer.email)
       .order("created_at", { ascending: false })
@@ -995,9 +1089,9 @@ app.get("/account/orders", async (req, res) => {
 
     const normalizedOrders = (orders || []).map((order) => ({
       ...order,
-      total_order_value: order.amount || 0,
-      paid_amount: order.amount || 0,
-      balance_due: 0,
+      total_order_value: order.total_order_value ?? order.amount ?? 0,
+      paid_amount: order.paid_amount ?? order.amount ?? 0,
+      balance_due: order.balance_due ?? 0,
     }))
 
     return res.json({
@@ -1242,7 +1336,14 @@ app.get("/portal-order", async (req, res) => {
       if (usedErr) console.error("⚠️ Failed to mark token used:", usedErr)
     }
 
-    const [storyIntakeRes, voiceNotesRes, callBookingsRes, deliverablesRes, revisionsRes, addonsRes] = await Promise.all([
+    const [
+      storyIntakeRes,
+      voiceNotesRes,
+      callBookingsRes,
+      deliverablesRes,
+      revisionsRes,
+      addonsRes,
+    ] = await Promise.all([
       supabase.from("story_intakes").select("*").eq("order_id", order.id).order("updated_at", { ascending: false }),
       supabase.from("voice_notes").select("*").eq("order_id", order.id).order("created_at", { ascending: false }),
       supabase.from("call_bookings").select("*").eq("order_id", order.id).order("created_at", { ascending: false }),
@@ -1256,7 +1357,12 @@ app.get("/portal-order", async (req, res) => {
       return res.redirect(302, target)
     }
 
-    const activeStoryIntake = await getActiveStoryIntake(order.id)
+    const activeStoryIntake =
+      (storyIntakeRes.data || []).find(
+        (item) => item.submitted !== true && !item.submitted_at
+      ) ||
+      (storyIntakeRes.data || [])[0] ||
+      null
 
     return res.json({
       success: true,
@@ -1691,7 +1797,9 @@ app.post("/story/submit-intake", async (req, res) => {
     const { data: intake, error: intakeErr } = await supabase
       .from("story_intakes")
       .update({
+        submitted: true,
         submitted_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
       })
       .eq("id", intakeDraft.id)
       .select("*")
@@ -1800,9 +1908,16 @@ app.post("/submit-story", async (req, res) => {
       return res.json({ success: true, story_submitted: true })
     }
 
+    const cleanStory = normalizeText(story, 80000)
+
     const { error: updateError } = await supabase
       .from("orders")
-      .update({ story, story_submitted: true, story_submitted_at: new Date().toISOString() })
+      .update({
+        story: cleanStory,
+        story_submitted: true,
+        story_submitted_at: new Date().toISOString(),
+        production_status: "story_submitted",
+      })
       .eq("id", order.id)
 
     if (updateError) {
@@ -1821,7 +1936,7 @@ app.post("/submit-story", async (req, res) => {
         <p><strong>Phone:</strong> ${escapeHtml(order.phone)}</p>
         <hr />
         <h3>Story</h3>
-        <pre style="white-space: pre-wrap; font-family: serif;">${escapeHtml(story)}</pre>
+        <pre style="white-space: pre-wrap; font-family: serif;">${escapeHtml(cleanStory)}</pre>
       `,
     })
 
@@ -1959,7 +2074,7 @@ const ADMIN_ALLOWED_ORIGINS = new Set([
 
 const ADMIN_TOKEN_TTL_SECONDS = 60 * 60 * 12
 const ADMIN_UUID_RE =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{12}$/i
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
 class AdminInputError extends Error {
   constructor(message) {
@@ -2235,7 +2350,14 @@ app.get("/admin/orders/:id", requireAdmin, adminAsync(async (req, res) => {
     return adminHandleSupabaseError(res, orderResult.error, "Unable to load order.")
   }
 
-  const [storyIntakesResult, voiceNotesResult, callBookingsResult, deliverablesResult, revisionsResult, addonsResult] = await Promise.all([
+  const [
+    storyIntakesResult,
+    voiceNotesResult,
+    callBookingsResult,
+    deliverablesResult,
+    revisionsResult,
+    addonsResult,
+  ] = await Promise.all([
     supabase.from("story_intakes").select("*").eq("order_id", id).order("updated_at", { ascending: false }),
     supabase.from("voice_notes").select("*").eq("order_id", id).order("created_at", { ascending: false }),
     supabase.from("call_bookings").select("*").eq("order_id", id).order("created_at", { ascending: false }),
@@ -2244,12 +2366,23 @@ app.get("/admin/orders/:id", requireAdmin, adminAsync(async (req, res) => {
     supabase.from("order_addons").select("*").eq("order_id", id).order("created_at", { ascending: false }),
   ])
 
-  const relatedResults = [storyIntakesResult, voiceNotesResult, callBookingsResult, deliverablesResult, revisionsResult, addonsResult]
+  const relatedResults = [
+    storyIntakesResult,
+    voiceNotesResult,
+    callBookingsResult,
+    deliverablesResult,
+    revisionsResult,
+    addonsResult,
+  ]
+
   const relatedError = relatedResults.find((result) => result.error)
   if (relatedError) return adminHandleSupabaseError(res, relatedError.error, "Unable to load related order data.")
 
   const storyIntakes = storyIntakesResult.data || []
-  const activeStoryIntake = await getActiveStoryIntake(id)
+  const activeStoryIntake =
+    storyIntakes.find((item) => item.submitted !== true && !item.submitted_at) ||
+    storyIntakes[0] ||
+    null
 
   return res.json({
     success: true,
