@@ -3,6 +3,7 @@
 // - Backend calculates prices safely
 // - Breeze Edition kept at ₹2 for testing
 // - Razorpay signature verification fixed
+// - Account login upgraded from magic link to email OTP
 // - Existing routes preserved: dispatch hook, email debug, portal link, portal order, submit story
 
 const express = require("express")
@@ -26,54 +27,7 @@ app.use(
 )
 
 app.use(express.json({ limit: "2mb" }))
-/* =========================
-   CUSTOMER ACCOUNT HELPERS
-========================= */
 
-const ACCOUNT_SESSION_DAYS = 180
-
-function normalizeEmail(email) {
-  return String(email || "").trim().toLowerCase()
-}
-
-function createToken(bytes = 32) {
-  return crypto.randomBytes(bytes).toString("hex")
-}
-
-async function getCustomerFromSession(req) {
-  const authHeader = String(req.header("Authorization") || "")
-
-  if (!authHeader.startsWith("Bearer ")) {
-    return { error: "Missing account session", status: 401 }
-  }
-
-  const sessionToken = authHeader.replace("Bearer ", "").trim()
-
-  if (!sessionToken) {
-    return { error: "Missing account session", status: 401 }
-  }
-
-  const { data: session, error } = await supabase
-    .from("customer_sessions")
-    .select("*")
-    .eq("session_token", sessionToken)
-    .eq("revoked", false)
-    .single()
-
-  if (error || !session) {
-    return { error: "Invalid or expired account session", status: 401 }
-  }
-
-  await supabase
-    .from("customer_sessions")
-    .update({ last_seen_at: new Date().toISOString() })
-    .eq("id", session.id)
-
-  return {
-    email: normalizeEmail(session.email),
-    session,
-  }
-}
 /* =========================
    HELPERS
 ========================= */
@@ -93,7 +47,33 @@ const safeErr = (e) => {
   if (e?.response) obj.response = e.response
   if (e?.cause) obj.cause = e.cause
   if (e?.stack) obj.stack = e.stack.split("\n").slice(0, 6).join("\n")
+
   return obj
+}
+
+function normalizeEmail(email) {
+  return String(email || "").trim().toLowerCase()
+}
+
+function createToken(bytes = 32) {
+  return crypto.randomBytes(bytes).toString("hex")
+}
+
+function createOtp() {
+  return String(crypto.randomInt(100000, 1000000))
+}
+
+function hashOtp(email, otp) {
+  const secret =
+    process.env.OTP_SECRET ||
+    process.env.RAZORPAY_KEY_SECRET ||
+    process.env.SUPABASE_SERVICE_ROLE_KEY ||
+    "soulscript-otp-fallback-secret"
+
+  return crypto
+    .createHmac("sha256", secret)
+    .update(`${normalizeEmail(email)}:${String(otp).trim()}`)
+    .digest("hex")
 }
 
 /* =========================
@@ -131,11 +111,52 @@ const razorpay = new Razorpay({
 const AIRTABLE_WEBHOOK_SECRET = process.env.AIRTABLE_WEBHOOK_SECRET || ""
 
 /* =========================
+   CUSTOMER ACCOUNT HELPERS
+========================= */
+const ACCOUNT_SESSION_DAYS = 180
+const OTP_EXPIRY_MINUTES = 10
+
+async function getCustomerFromSession(req) {
+  const authHeader = String(req.header("Authorization") || "")
+
+  if (!authHeader.startsWith("Bearer ")) {
+    return { error: "Missing account session", status: 401 }
+  }
+
+  const sessionToken = authHeader.replace("Bearer ", "").trim()
+
+  if (!sessionToken) {
+    return { error: "Missing account session", status: 401 }
+  }
+
+  const { data: session, error } = await supabase
+    .from("customer_sessions")
+    .select("*")
+    .eq("session_token", sessionToken)
+    .eq("revoked", false)
+    .single()
+
+  if (error || !session) {
+    return { error: "Invalid or expired account session", status: 401 }
+  }
+
+  await supabase
+    .from("customer_sessions")
+    .update({ last_seen_at: new Date().toISOString() })
+    .eq("id", session.id)
+
+  return {
+    email: normalizeEmail(session.email),
+    session,
+  }
+}
+
+/* =========================
    PRICING RULES
 ========================= */
 
 const EDITION_PRICES = {
-  "Breeze Edition": 2, // testing only
+  "Breeze Edition": 2,
   "Confession Edition": 1999,
   "Classic Edition": 2599,
   "Essence Edition": 3499,
@@ -170,7 +191,7 @@ function calculateCheckoutAmount({ edition, paymentType, ultraPriority }) {
 }
 
 /* =========================
-   PRICING QUOTE (no order created)
+   PRICING QUOTE
 ========================= */
 app.post("/quote", (req, res) => {
   try {
@@ -208,6 +229,8 @@ app.get("/health", (req, res) => {
     emailFrom: EMAIL_FROM,
     adminEmail: ADMIN_EMAIL,
     pricing: EDITION_PRICES,
+    accountLogin: "email_otp",
+    otpExpiryMinutes: OTP_EXPIRY_MINUTES,
   })
 })
 
@@ -379,7 +402,7 @@ app.post("/confirm-payment", async (req, res) => {
     const pendingAmount = Number(notes.pendingAmount || 0)
     const ultraPriority = notes.ultraPriority === "yes"
 
-    const normalizedEmail = String(customer.email || "").trim().toLowerCase()
+    const normalizedEmail = normalizeEmail(customer.email)
 
     const normalizedPaymentType =
       paymentType === "PREPAID" ? "PREPAID" : "ADVANCE"
@@ -440,7 +463,7 @@ app.post("/confirm-payment", async (req, res) => {
 
     return res.json({
       success: true,
-nextUrl: `/story?order=${razorpay_order_id}`,
+      nextUrl: `/story?order=${razorpay_order_id}`,
       razorpayOrderId: razorpay_order_id,
     })
   } catch (err) {
@@ -453,124 +476,162 @@ nextUrl: `/story?order=${razorpay_order_id}`,
 })
 
 /* =========================
-   CUSTOMER ACCOUNT LOGIN
+   CUSTOMER ACCOUNT OTP LOGIN
 ========================= */
 
+async function sendAccountOtpForEmail(email, res) {
+  const cleanEmail = normalizeEmail(email)
+
+  if (!cleanEmail || !cleanEmail.includes("@")) {
+    return res.status(400).json({ error: "Valid email required" })
+  }
+
+  const { data: existingOrders, error: orderCheckErr } = await supabase
+    .from("orders")
+    .select("id")
+    .eq("email", cleanEmail)
+    .limit(1)
+
+  if (orderCheckErr) {
+    console.error("❌ Failed to check customer orders:", orderCheckErr)
+    return res.status(500).json({ error: "Could not check account" })
+  }
+
+  if (!existingOrders || existingOrders.length === 0) {
+    return res.status(404).json({
+      error: "No orders found with this email. Please use the email entered during checkout.",
+    })
+  }
+
+  const otp = createOtp()
+  const otpHash = hashOtp(cleanEmail, otp)
+  const expiresAt = new Date(Date.now() + OTP_EXPIRY_MINUTES * 60 * 1000).toISOString()
+
+  await supabase
+    .from("customer_login_tokens")
+    .update({ used: true })
+    .eq("email", cleanEmail)
+    .eq("used", false)
+
+  const { error: tokenErr } = await supabase
+    .from("customer_login_tokens")
+    .insert({
+      email: cleanEmail,
+      token: otpHash,
+      expires_at: expiresAt,
+      used: false,
+    })
+
+  if (tokenErr) {
+    console.error("❌ Failed to create account OTP:", tokenErr)
+    return res.status(500).json({ error: "Could not create OTP" })
+  }
+
+  const html = `
+    <div style="font-family: Inter, Arial, sans-serif; line-height:1.6;">
+      <p>Hi,</p>
+      <p>Your SoulScript Legacy account login code is:</p>
+
+      <div style="font-size:28px;letter-spacing:8px;font-weight:700;background:#f4f0e8;color:#111;padding:16px 18px;display:inline-block;border-radius:10px;margin:8px 0;">
+        ${otp}
+      </div>
+
+      <p style="color:#555;font-size:13px;">
+        This OTP expires in ${OTP_EXPIRY_MINUTES} minutes. Do not share this code with anyone.
+      </p>
+
+      <p>— SoulScript Legacy</p>
+    </div>
+  `
+
+  try {
+    const r = await resend.emails.send({
+      from: EMAIL_FROM,
+      to: [cleanEmail],
+      subject: "Your SoulScript Legacy login code",
+      html,
+    })
+
+    console.log("📨 Account OTP email sent:", cleanEmail, r?.id || r)
+
+    return res.json({
+      success: true,
+      message: "OTP sent to your email",
+      email: cleanEmail,
+      expiresInMinutes: OTP_EXPIRY_MINUTES,
+    })
+  } catch (emailErr) {
+    console.error("❌ Account OTP email failed:", safeErr(emailErr))
+
+    return res.status(500).json({
+      error: "Could not send account OTP email",
+      details: safeErr(emailErr),
+    })
+  }
+}
+
+app.post("/account/send-otp", async (req, res) => {
+  try {
+    return await sendAccountOtpForEmail(req.body?.email, res)
+  } catch (err) {
+    console.error("❌ /account/send-otp error:", safeErr(err))
+    return res.status(500).json({ error: "Server error" })
+  }
+})
+
+// Backward compatible alias.
+// Your old Account page can call this and still receive OTP instead of magic link.
 app.post("/account/send-login-link", async (req, res) => {
   try {
+    return await sendAccountOtpForEmail(req.body?.email, res)
+  } catch (err) {
+    console.error("❌ /account/send-login-link alias error:", safeErr(err))
+    return res.status(500).json({ error: "Server error" })
+  }
+})
+
+app.post("/account/verify-otp", async (req, res) => {
+  try {
     const email = normalizeEmail(req.body?.email)
+    const otp = String(req.body?.otp || "").trim()
 
     if (!email || !email.includes("@")) {
       return res.status(400).json({ error: "Valid email required" })
     }
 
-    const { data: existingOrders, error: orderCheckErr } = await supabase
-      .from("orders")
-      .select("id")
-      .eq("email", email)
-      .limit(1)
-
-    if (orderCheckErr) {
-      console.error("❌ Failed to check customer orders:", orderCheckErr)
-      return res.status(500).json({ error: "Could not check account" })
+    if (!otp || !/^\d{6}$/.test(otp)) {
+      return res.status(400).json({ error: "Valid 6-digit OTP required" })
     }
 
-    if (!existingOrders || existingOrders.length === 0) {
-      return res.status(404).json({
-        error: "No orders found with this email. Please use the email entered during checkout.",
-      })
-    }
-
-    const token = createToken(32)
-    const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString()
-
-    const { error: tokenErr } = await supabase
-      .from("customer_login_tokens")
-      .insert({
-        email,
-        token,
-        expires_at: expiresAt,
-        used: false,
-      })
-
-    if (tokenErr) {
-      console.error("❌ Failed to create account login token:", tokenErr)
-      return res.status(500).json({ error: "Could not create login link" })
-    }
-
-    const loginUrl = `${PORTAL_BASE_URL}/account-login?token=${token}`
-
-    const html = `
-      <div style="font-family: Inter, Arial, sans-serif; line-height:1.6;">
-        <p>Hi,</p>
-        <p>Use the button below to access your SoulScript Legacy account.</p>
-
-        <p>
-          <a href="${loginUrl}" style="display:inline-block;padding:12px 16px;background:#000;color:#fff;text-decoration:none;border-radius:10px;">
-            Open My Account
-          </a>
-        </p>
-
-        <p style="color:#555;font-size:13px;">
-          This login link expires in 30 minutes. Once opened, your account will stay logged in on this browser unless you log out.
-        </p>
-
-        <p>— SoulScript Legacy</p>
-      </div>
-    `
-
-    try {
-      const r = await resend.emails.send({
-        from: EMAIL_FROM,
-        to: [email],
-        subject: "Your SoulScript Legacy account login",
-        html,
-      })
-
-      console.log("📨 Account login email sent:", email, r?.id || r)
-
-      return res.json({
-        success: true,
-        message: "Account login link sent",
-      })
-    } catch (emailErr) {
-      console.error("❌ Account login email failed:", safeErr(emailErr))
-
-      return res.status(500).json({
-        error: "Could not send account login email",
-        details: safeErr(emailErr),
-      })
-    }
-  } catch (err) {
-    console.error("❌ /account/send-login-link error:", safeErr(err))
-    return res.status(500).json({ error: "Server error" })
-  }
-})
-
-app.get("/account/verify-login", async (req, res) => {
-  try {
-    const token = String(req.query.token || "").trim()
-
-    if (!token) {
-      return res.status(400).json({ error: "Login token missing" })
-    }
-
-    const { data: loginToken, error: tokenErr } = await supabase
+    const { data: tokens, error: tokenErr } = await supabase
       .from("customer_login_tokens")
       .select("*")
-      .eq("token", token)
+      .eq("email", email)
       .eq("used", false)
-      .single()
+      .order("expires_at", { ascending: false })
+      .limit(1)
+
+    const loginToken = tokens?.[0]
 
     if (tokenErr || !loginToken) {
-      return res.status(401).json({ error: "Invalid or already used login link" })
+      return res.status(401).json({ error: "Invalid or expired OTP" })
     }
 
     if (new Date(loginToken.expires_at).getTime() < Date.now()) {
-      return res.status(410).json({ error: "Login link expired" })
+      await supabase
+        .from("customer_login_tokens")
+        .update({ used: true })
+        .eq("id", loginToken.id)
+
+      return res.status(410).json({ error: "OTP expired. Please request a new one." })
     }
 
-    const email = normalizeEmail(loginToken.email)
+    const expectedHash = hashOtp(email, otp)
+
+    if (loginToken.token !== expectedHash) {
+      return res.status(401).json({ error: "Incorrect OTP" })
+    }
+
     const sessionToken = createToken(40)
 
     const { error: sessionErr } = await supabase
@@ -598,9 +659,17 @@ app.get("/account/verify-login", async (req, res) => {
       expiresInDays: ACCOUNT_SESSION_DAYS,
     })
   } catch (err) {
-    console.error("❌ /account/verify-login error:", safeErr(err))
+    console.error("❌ /account/verify-otp error:", safeErr(err))
     return res.status(500).json({ error: "Server error" })
   }
+})
+
+// Old magic-link verify endpoint kept only so old links do not crash the backend.
+// Frontend should stop using this.
+app.get("/account/verify-login", async (req, res) => {
+  return res.status(410).json({
+    error: "Magic login links are no longer supported. Please request an email OTP.",
+  })
 })
 
 app.get("/account/me", async (req, res) => {
@@ -676,6 +745,7 @@ app.post("/account/logout", async (req, res) => {
     return res.status(500).json({ error: "Server error" })
   }
 })
+
 /* =========================
    CUSTOMER PROFILE FROM ORDERS
 ========================= */
@@ -749,7 +819,7 @@ app.post("/account/profile", async (req, res) => {
       })
       .eq("email", customer.email)
       .select("id, name, phone, email, address")
-    
+
     if (error) {
       console.error("❌ Failed to update account profile:", error)
       return res.status(500).json({ error: "Failed to update profile" })
@@ -771,45 +841,15 @@ app.post("/account/profile", async (req, res) => {
     return res.status(500).json({ error: "Server error" })
   }
 })
+
 /* =========================
    CUSTOMER MY ORDERS
+   Legacy API kept, but account page should use /account/orders.
 ========================= */
 app.get("/my-orders", async (req, res) => {
   try {
-    const authHeader = String(req.header("Authorization") || "")
-
-    if (!authHeader.startsWith("Bearer ")) {
-      return res.status(401).json({ error: "Missing login token" })
-    }
-
-    const token = authHeader.replace("Bearer ", "").trim()
-
-    const { data: userData, error: userErr } = await supabase.auth.getUser(token)
-
-    if (userErr || !userData?.user?.email) {
-      console.error("❌ Invalid user token:", userErr)
-      return res.status(401).json({ error: "Invalid or expired login" })
-    }
-
-    const email = String(userData.user.email).trim().toLowerCase()
-
-    const { data: orders, error: ordersErr } = await supabase
-      .from("orders")
-      .select(
-        "id, razorpay_order_id, edition, payment_type, amount, name, phone, email, address, created_at, story_submitted"
-      )
-      .eq("email", email)
-      .order("created_at", { ascending: false })
-
-    if (ordersErr) {
-      console.error("❌ Failed to fetch customer orders:", ordersErr)
-      return res.status(500).json({ error: "Failed to fetch orders" })
-    }
-
-    return res.json({
-      success: true,
-      email,
-      orders: orders || [],
+    return res.status(410).json({
+      error: "Legacy my-orders endpoint is no longer used. Please use /account/orders.",
     })
   } catch (err) {
     console.error("❌ /my-orders error:", safeErr(err))
@@ -823,7 +863,7 @@ app.get("/my-orders", async (req, res) => {
 app.post("/send-portal-link", async (req, res) => {
   try {
     const { email } = req.body
-    const normalizedEmail = String(email || "").trim().toLowerCase()
+    const normalizedEmail = normalizeEmail(email)
 
     if (!normalizedEmail || !normalizedEmail.includes("@")) {
       return res.status(400).json({ error: "Valid email required" })
@@ -900,7 +940,7 @@ app.post("/send-portal-link", async (req, res) => {
           to: [ADMIN_EMAIL],
           subject: "⚠️ Portal link fallback (customer blocked)",
           html: `
-            <p><b>Customer email (blocked):</b> ${normalizedEmail}</p>
+            <p><b>Customer email blocked:</b> ${normalizedEmail}</p>
             <p><b>Reason:</b> ${err?.message || "Resend blocked"}</p>
             <hr/>
             ${html}
@@ -1003,6 +1043,7 @@ app.get("/portal-order", async (req, res) => {
     return res.status(500).json({ error: "Server error" })
   }
 })
+
 /* =========================
    SUBMIT STORY
 ========================= */
@@ -1087,4 +1128,5 @@ app.listen(PORT, () => {
   console.log(`✅ PORTAL_BASE_URL = ${PORTAL_BASE_URL}`)
   console.log(`✅ EMAIL_FROM      = ${EMAIL_FROM}`)
   console.log(`✅ ADMIN_EMAIL     = ${ADMIN_EMAIL}`)
+  console.log(`✅ ACCOUNT LOGIN   = Email OTP`)
 })
