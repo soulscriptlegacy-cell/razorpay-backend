@@ -872,7 +872,7 @@ app.get("/account/orders", async (req, res) => {
     const { data: orders, error: ordersErr } = await supabase
       .from("orders")
       .select(
-        "id, razorpay_order_id, edition, payment_type, amount, total_order_value, paid_amount, balance_due, name, phone, email, address, created_at, story_submitted"
+        "id, razorpay_order_id, edition, payment_type, amount, name, phone, email, address, created_at, story_submitted"
       )
       .eq("email", customer.email)
       .order("created_at", { ascending: false })
@@ -882,7 +882,18 @@ app.get("/account/orders", async (req, res) => {
       return res.status(500).json({ error: "Failed to fetch orders" })
     }
 
-    return res.json({ success: true, email: customer.email, orders: orders || [] })
+    const normalizedOrders = (orders || []).map((order) => ({
+      ...order,
+      total_order_value: order.amount || 0,
+      paid_amount: order.amount || 0,
+      balance_due: 0,
+    }))
+
+    return res.json({
+      success: true,
+      email: customer.email,
+      orders: normalizedOrders,
+    })
   } catch (err) {
     console.error("❌ /account/orders error:", safeErr(err))
     return res.status(500).json({ error: "Server error" })
