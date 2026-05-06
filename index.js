@@ -5,6 +5,7 @@
 // - Razorpay signature verification fixed
 // - Account login upgraded from magic link to email OTP
 // - Existing routes preserved: dispatch hook, email debug, portal link, portal order, submit story
+// - Admin API added for SoulScript admin panel
 
 const express = require("express")
 const Razorpay = require("razorpay")
@@ -21,7 +22,7 @@ const app = express()
 app.use(
   cors({
     origin: "*",
-    methods: ["GET", "POST", "OPTIONS"],
+    methods: ["GET", "POST", "PATCH", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 )
@@ -1211,6 +1212,720 @@ app.post("/submit-story", async (req, res) => {
 })
 
 /* =========================
+   SOULSCRIPT LEGACY ADMIN API
+========================= */
+
+const adminCrypto = crypto
+
+const ADMIN_ALLOWED_ORIGINS = new Set([
+  "https://admin.soulscriptlegacy.com",
+  "https://soulscript-admin.vercel.app",
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+])
+
+const ADMIN_TOKEN_TTL_SECONDS = 60 * 60 * 12
+const ADMIN_UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{12}$/i
+
+class AdminInputError extends Error {
+  constructor(message) {
+    super(message)
+    this.status = 400
+  }
+}
+
+app.use("/admin", (req, res, next) => {
+  const origin = req.headers.origin
+
+  if (origin && ADMIN_ALLOWED_ORIGINS.has(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin)
+    res.setHeader("Vary", "Origin")
+  }
+
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization")
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS")
+
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204)
+  }
+
+  return next()
+})
+
+function adminJsonError(res, status, message) {
+  return res.status(status).json({
+    success: false,
+    message,
+  })
+}
+
+function adminAsync(handler) {
+  return async (req, res, next) => {
+    try {
+      await handler(req, res, next)
+    } catch (error) {
+      if (error instanceof AdminInputError) {
+        return adminJsonError(res, error.status, error.message)
+      }
+
+      console.error("Admin route error:", error)
+      return adminJsonError(res, 500, "Admin request failed.")
+    }
+  }
+}
+
+function adminConfig() {
+  const email = process.env.ADMIN_PANEL_EMAIL
+  const password = process.env.ADMIN_PANEL_PASSWORD
+  const secret = process.env.ADMIN_JWT_SECRET || process.env.ADMIN_SESSION_SECRET
+
+  if (!email || !password || !secret) {
+    return null
+  }
+
+  return { email, password, secret }
+}
+
+function adminSecureEqual(left, right) {
+  const leftHash = adminCrypto
+    .createHash("sha256")
+    .update(String(left))
+    .digest()
+
+  const rightHash = adminCrypto
+    .createHash("sha256")
+    .update(String(right))
+    .digest()
+
+  return adminCrypto.timingSafeEqual(leftHash, rightHash)
+}
+
+function adminSignToken(input) {
+  const config = adminConfig()
+  if (!config) throw new Error("Admin auth environment variables are missing.")
+
+  return adminCrypto
+    .createHmac("sha256", config.secret)
+    .update(input)
+    .digest("base64url")
+}
+
+function adminCreateToken(email) {
+  const header = Buffer.from(
+    JSON.stringify({ alg: "HS256", typ: "JWT" })
+  ).toString("base64url")
+
+  const now = Math.floor(Date.now() / 1000)
+
+  const payload = Buffer.from(
+    JSON.stringify({
+      sub: "soulscript-admin",
+      email,
+      iat: now,
+      exp: now + ADMIN_TOKEN_TTL_SECONDS,
+    })
+  ).toString("base64url")
+
+  const signature = adminSignToken(`${header}.${payload}`)
+
+  return `${header}.${payload}.${signature}`
+}
+
+function adminVerifyToken(token) {
+  if (!token || typeof token !== "string") return null
+
+  const parts = token.split(".")
+  if (parts.length !== 3) return null
+
+  const [header, payload, signature] = parts
+  const expectedSignature = adminSignToken(`${header}.${payload}`)
+
+  if (!adminSecureEqual(signature, expectedSignature)) return null
+
+  let parsed
+  try {
+    parsed = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"))
+  } catch {
+    return null
+  }
+
+  if (parsed.sub !== "soulscript-admin") return null
+  if (!parsed.exp || parsed.exp < Math.floor(Date.now() / 1000)) return null
+
+  return parsed
+}
+
+function requireAdmin(req, res, next) {
+  const authHeader = req.headers.authorization || ""
+  const [scheme, token] = authHeader.split(" ")
+
+  if (scheme !== "Bearer" || !token) {
+    return adminJsonError(res, 401, "Admin authentication required.")
+  }
+
+  let admin
+  try {
+    admin = adminVerifyToken(token)
+  } catch (error) {
+    console.error("Admin token verification failed:", error)
+    return adminJsonError(res, 401, "Invalid admin session.")
+  }
+
+  if (!admin) {
+    return adminJsonError(res, 401, "Invalid admin session.")
+  }
+
+  req.admin = admin
+  return next()
+}
+
+function adminRequireUuid(id, label = "id") {
+  if (!id || !ADMIN_UUID_RE.test(String(id))) {
+    throw new AdminInputError(`Invalid ${label}.`)
+  }
+
+  return String(id)
+}
+
+function adminHasOwn(body, key) {
+  return Object.prototype.hasOwnProperty.call(body || {}, key)
+}
+
+function adminStringOrNull(value, field, maxLength) {
+  if (value === undefined) return undefined
+  if (value === null) return null
+  if (typeof value !== "string") {
+    throw new AdminInputError(`${field} must be a string.`)
+  }
+
+  const trimmed = value.trim()
+  if (trimmed.length > maxLength) {
+    throw new AdminInputError(`${field} is too long.`)
+  }
+
+  return trimmed || null
+}
+
+function adminNumberOrNull(value, field) {
+  if (value === undefined) return undefined
+  if (value === null || value === "") return null
+
+  const numberValue = typeof value === "number" ? value : Number(value)
+  if (!Number.isFinite(numberValue) || numberValue < 0) {
+    throw new AdminInputError(`${field} must be a non-negative number.`)
+  }
+
+  return numberValue
+}
+
+function adminBoolean(value, field) {
+  if (value === undefined) return undefined
+  if (typeof value === "boolean") return value
+  if (value === "true") return true
+  if (value === "false") return false
+  throw new AdminInputError(`${field} must be a boolean.`)
+}
+
+function adminRevisionStatus(value) {
+  if (value === undefined) return undefined
+  if (typeof value !== "string") {
+    throw new AdminInputError("status must be a string.")
+  }
+
+  const status = value.trim()
+  if (!/^[a-zA-Z0-9 _-]{1,60}$/.test(status)) {
+    throw new AdminInputError("status contains invalid characters.")
+  }
+
+  return status
+}
+
+function adminHandleSupabaseError(res, error, message = "Database request failed.") {
+  console.error(message, error)
+  return adminJsonError(res, 500, message)
+}
+
+const ADMIN_ORDER_LIST_FIELDS = [
+  "id",
+  "created_at",
+  "name",
+  "phone",
+  "email",
+  "edition",
+  "payment_type",
+  "amount",
+  "story_submitted",
+  "razorpay_order_id",
+].join(",")
+
+const ADMIN_ORDER_DETAIL_FIELDS = [
+  "id",
+  "razorpay_order_id",
+  "razorpay_payment_id",
+  "edition",
+  "payment_type",
+  "amount",
+  "name",
+  "phone",
+  "email",
+  "address",
+  "created_at",
+  "story",
+  "story_submitted",
+].join(",")
+
+app.post(
+  "/admin/login",
+  adminAsync(async (req, res) => {
+    const config = adminConfig()
+
+    if (!config) {
+      return adminJsonError(res, 500, "Admin auth is not configured.")
+    }
+
+    const email = adminStringOrNull(req.body && req.body.email, "email", 320)
+    const password = adminStringOrNull(
+      req.body && req.body.password,
+      "password",
+      1000
+    )
+
+    if (!email || !password) {
+      return adminJsonError(res, 400, "Email and password are required.")
+    }
+
+    const emailMatches = adminSecureEqual(
+      email.toLowerCase(),
+      config.email.toLowerCase()
+    )
+
+    const passwordMatches = adminSecureEqual(password, config.password)
+
+    if (!emailMatches || !passwordMatches) {
+      return adminJsonError(res, 401, "Invalid admin credentials.")
+    }
+
+    return res.json({
+      success: true,
+      adminToken: adminCreateToken(config.email),
+    })
+  })
+)
+
+app.get(
+  "/admin/me",
+  requireAdmin,
+  adminAsync(async (req, res) => {
+    return res.json({
+      success: true,
+      admin: {
+        email: req.admin.email,
+      },
+    })
+  })
+)
+
+app.get(
+  "/admin/dashboard",
+  requireAdmin,
+  adminAsync(async (req, res) => {
+    const [ordersResult, revisionsResult, deliverablesResult] =
+      await Promise.all([
+        supabase.from("orders").select("amount, story_submitted"),
+        supabase.from("revisions").select("status"),
+        supabase.from("deliverables").select("delivered_at"),
+      ])
+
+    if (ordersResult.error) {
+      return adminHandleSupabaseError(
+        res,
+        ordersResult.error,
+        "Unable to load dashboard orders."
+      )
+    }
+
+    if (revisionsResult.error) {
+      return adminHandleSupabaseError(
+        res,
+        revisionsResult.error,
+        "Unable to load dashboard revisions."
+      )
+    }
+
+    if (deliverablesResult.error) {
+      return adminHandleSupabaseError(
+        res,
+        deliverablesResult.error,
+        "Unable to load dashboard deliverables."
+      )
+    }
+
+    const orders = ordersResult.data || []
+    const revisions = revisionsResult.data || []
+    const deliverables = deliverablesResult.data || []
+
+    const closedRevisionStatuses = new Set([
+      "complete",
+      "completed",
+      "done",
+      "resolved",
+      "cancelled",
+      "canceled",
+    ])
+
+    const totalRevenue = orders.reduce((sum, order) => {
+      const amount = Number(order.amount || 0)
+      return Number.isFinite(amount) ? sum + amount : sum
+    }, 0)
+
+    return res.json({
+      success: true,
+      dashboard: {
+        total_orders: orders.length,
+        pending_story_submissions: orders.filter((order) => !order.story_submitted)
+          .length,
+        submitted_stories: orders.filter((order) => order.story_submitted).length,
+        pending_revisions: revisions.filter((revision) => {
+          const status = String(revision.status || "pending").toLowerCase()
+          return !closedRevisionStatuses.has(status)
+        }).length,
+        pending_deliverables: deliverables.filter(
+          (deliverable) => !deliverable.delivered_at
+        ).length,
+        total_revenue_collected: totalRevenue,
+      },
+    })
+  })
+)
+
+app.get(
+  "/admin/orders",
+  requireAdmin,
+  adminAsync(async (req, res) => {
+    const { data, error } = await supabase
+      .from("orders")
+      .select(ADMIN_ORDER_LIST_FIELDS)
+      .order("created_at", { ascending: false })
+
+    if (error) {
+      return adminHandleSupabaseError(res, error, "Unable to load orders.")
+    }
+
+    return res.json({
+      success: true,
+      orders: data || [],
+    })
+  })
+)
+
+app.get(
+  "/admin/orders/:id",
+  requireAdmin,
+  adminAsync(async (req, res) => {
+    const id = adminRequireUuid(req.params.id, "order id")
+
+    const orderResult = await supabase
+      .from("orders")
+      .select(ADMIN_ORDER_DETAIL_FIELDS)
+      .eq("id", id)
+      .single()
+
+    if (orderResult.error) {
+      if (orderResult.error.code === "PGRST116") {
+        return adminJsonError(res, 404, "Order not found.")
+      }
+
+      return adminHandleSupabaseError(
+        res,
+        orderResult.error,
+        "Unable to load order."
+      )
+    }
+
+    const [
+      storyIntakesResult,
+      voiceNotesResult,
+      callBookingsResult,
+      deliverablesResult,
+      revisionsResult,
+    ] = await Promise.all([
+      supabase
+        .from("story_intakes")
+        .select("*")
+        .eq("order_id", id)
+        .order("submitted_at", { ascending: false }),
+
+      supabase
+        .from("voice_notes")
+        .select("*")
+        .eq("order_id", id)
+        .order("created_at", { ascending: false }),
+
+      supabase
+        .from("call_bookings")
+        .select("*")
+        .eq("order_id", id)
+        .order("created_at", { ascending: false }),
+
+      supabase
+        .from("deliverables")
+        .select("*")
+        .eq("order_id", id)
+        .order("uploaded_at", { ascending: false }),
+
+      supabase
+        .from("revisions")
+        .select("*")
+        .eq("order_id", id)
+        .order("created_at", { ascending: false }),
+    ])
+
+    const relatedResults = [
+      storyIntakesResult,
+      voiceNotesResult,
+      callBookingsResult,
+      deliverablesResult,
+      revisionsResult,
+    ]
+
+    const relatedError = relatedResults.find((result) => result.error)
+
+    if (relatedError) {
+      return adminHandleSupabaseError(
+        res,
+        relatedError.error,
+        "Unable to load related order data."
+      )
+    }
+
+    const storyIntakes = storyIntakesResult.data || []
+
+    return res.json({
+      success: true,
+      order: {
+        ...orderResult.data,
+        story_intake: storyIntakes[0] || null,
+        story_intakes: storyIntakes,
+        voice_notes: voiceNotesResult.data || [],
+        call_bookings: callBookingsResult.data || [],
+        deliverables: deliverablesResult.data || [],
+        revisions: revisionsResult.data || [],
+      },
+    })
+  })
+)
+
+app.patch(
+  "/admin/orders/:id",
+  requireAdmin,
+  adminAsync(async (req, res) => {
+    const id = adminRequireUuid(req.params.id, "order id")
+    const updates = {}
+
+    if (adminHasOwn(req.body, "name")) {
+      updates.name = adminStringOrNull(req.body.name, "name", 180)
+    }
+
+    if (adminHasOwn(req.body, "phone")) {
+      updates.phone = adminStringOrNull(req.body.phone, "phone", 40)
+    }
+
+    if (adminHasOwn(req.body, "address")) {
+      updates.address = adminStringOrNull(req.body.address, "address", 2000)
+    }
+
+    if (adminHasOwn(req.body, "edition")) {
+      updates.edition = adminStringOrNull(req.body.edition, "edition", 120)
+    }
+
+    if (adminHasOwn(req.body, "payment_type")) {
+      updates.payment_type = adminStringOrNull(
+        req.body.payment_type,
+        "payment_type",
+        80
+      )
+    }
+
+    if (adminHasOwn(req.body, "amount")) {
+      updates.amount = adminNumberOrNull(req.body.amount, "amount")
+    }
+
+    if (adminHasOwn(req.body, "story_submitted")) {
+      updates.story_submitted = adminBoolean(
+        req.body.story_submitted,
+        "story_submitted"
+      )
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return adminJsonError(res, 400, "No allowed order fields provided.")
+    }
+
+    const { data, error } = await supabase
+      .from("orders")
+      .update(updates)
+      .eq("id", id)
+      .select(ADMIN_ORDER_DETAIL_FIELDS)
+      .single()
+
+    if (error) {
+      if (error.code === "PGRST116") {
+        return adminJsonError(res, 404, "Order not found.")
+      }
+
+      return adminHandleSupabaseError(res, error, "Unable to update order.")
+    }
+
+    return res.json({
+      success: true,
+      order: data,
+    })
+  })
+)
+
+app.get(
+  "/admin/story-intakes",
+  requireAdmin,
+  adminAsync(async (req, res) => {
+    const { data, error } = await supabase
+      .from("story_intakes")
+      .select("*")
+      .order("submitted_at", { ascending: false })
+
+    if (error) {
+      return adminHandleSupabaseError(res, error, "Unable to load story intakes.")
+    }
+
+    return res.json({
+      success: true,
+      story_intakes: data || [],
+    })
+  })
+)
+
+app.get(
+  "/admin/voice-notes",
+  requireAdmin,
+  adminAsync(async (req, res) => {
+    const { data, error } = await supabase
+      .from("voice_notes")
+      .select("*")
+      .order("created_at", { ascending: false })
+
+    if (error) {
+      return adminHandleSupabaseError(res, error, "Unable to load voice notes.")
+    }
+
+    return res.json({
+      success: true,
+      voice_notes: data || [],
+    })
+  })
+)
+
+app.get(
+  "/admin/call-bookings",
+  requireAdmin,
+  adminAsync(async (req, res) => {
+    const { data, error } = await supabase
+      .from("call_bookings")
+      .select("*")
+      .order("created_at", { ascending: false })
+
+    if (error) {
+      return adminHandleSupabaseError(res, error, "Unable to load call bookings.")
+    }
+
+    return res.json({
+      success: true,
+      call_bookings: data || [],
+    })
+  })
+)
+
+app.get(
+  "/admin/deliverables",
+  requireAdmin,
+  adminAsync(async (req, res) => {
+    const { data, error } = await supabase
+      .from("deliverables")
+      .select("*")
+      .order("uploaded_at", { ascending: false })
+
+    if (error) {
+      return adminHandleSupabaseError(res, error, "Unable to load deliverables.")
+    }
+
+    return res.json({
+      success: true,
+      deliverables: data || [],
+    })
+  })
+)
+
+app.get(
+  "/admin/revisions",
+  requireAdmin,
+  adminAsync(async (req, res) => {
+    const { data, error } = await supabase
+      .from("revisions")
+      .select("*")
+      .order("created_at", { ascending: false })
+
+    if (error) {
+      return adminHandleSupabaseError(res, error, "Unable to load revisions.")
+    }
+
+    return res.json({
+      success: true,
+      revisions: data || [],
+    })
+  })
+)
+
+app.patch(
+  "/admin/revisions/:id",
+  requireAdmin,
+  adminAsync(async (req, res) => {
+    const id = adminRequireUuid(req.params.id, "revision id")
+    const updates = {}
+
+    if (adminHasOwn(req.body, "status")) {
+      updates.status = adminRevisionStatus(req.body.status)
+    }
+
+    if (adminHasOwn(req.body, "paid")) {
+      updates.paid = adminBoolean(req.body.paid, "paid")
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return adminJsonError(res, 400, "No allowed revision fields provided.")
+    }
+
+    const { data, error } = await supabase
+      .from("revisions")
+      .update(updates)
+      .eq("id", id)
+      .select("*")
+      .single()
+
+    if (error) {
+      if (error.code === "PGRST116") {
+        return adminJsonError(res, 404, "Revision not found.")
+      }
+
+      return adminHandleSupabaseError(res, error, "Unable to update revision.")
+    }
+
+    return res.json({
+      success: true,
+      revision: data,
+    })
+  })
+)
+
+/* =========================
    START SERVER
 ========================= */
 const PORT = process.env.PORT || 3000
@@ -1221,4 +1936,5 @@ app.listen(PORT, () => {
   console.log(`✅ EMAIL_FROM      = ${EMAIL_FROM}`)
   console.log(`✅ ADMIN_EMAIL     = ${ADMIN_EMAIL}`)
   console.log(`✅ ACCOUNT LOGIN   = Email OTP`)
+  console.log(`✅ ADMIN API       = Enabled`)
 })
