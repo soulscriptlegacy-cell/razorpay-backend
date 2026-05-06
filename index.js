@@ -1,3 +1,4 @@
+
 // index.js (SoulScript Legacy backend)
 // Checkout upgraded:
 // - Backend calculates prices safely
@@ -131,7 +132,19 @@ function normalizeStringArray(value, fallback = [], maxItems = 3) {
 }
 
 function safeJsonObject(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return {}
+  if (!value) return {}
+
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value)
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {}
+      return parsed
+    } catch {
+      return {}
+    }
+  }
+
+  if (typeof value !== "object" || Array.isArray(value)) return {}
   return value
 }
 
@@ -159,6 +172,15 @@ function addonLooksUltraPriority(addon) {
     metadataText.includes("ultra_priority") ||
     metadataText.includes("ultra priority")
   )
+}
+
+function addonIsPaid(addon) {
+  return addon?.status === "paid" || addon?.payment_status === "paid"
+}
+
+function addonAmount(addon) {
+  const amount = Number(addon?.amount || 0)
+  return Number.isFinite(amount) ? amount : 0
 }
 
 async function sendEmailSafe({ to, subject, html }) {
@@ -359,21 +381,29 @@ async function refreshOrderTotals(orderId) {
 
   if (orderErr || !order) return null
 
-  const basePrice = EDITION_PRICES[order.edition] || Number(order.amount || 0)
+  const editionBasePrice =
+    EDITION_PRICES[order.edition] ||
+    Number(order.total_order_value || order.amount || 0)
 
-  const { data: paidAddons } = await supabase
+  const { data: addonRows } = await supabase
     .from("order_addons")
-    .select("amount, status")
+    .select("addon_type, amount, status, payment_status, metadata")
     .eq("order_id", orderId)
-    .eq("status", "paid")
 
-  const paidAddonTotal = (paidAddons || []).reduce((sum, item) => {
-    const amount = Number(item.amount || 0)
-    return Number.isFinite(amount) ? sum + amount : sum
+  const paidAddons = (addonRows || []).filter(addonIsPaid)
+
+  const orderValueAddonTotal = paidAddons.reduce((sum, addon) => {
+    if (addon.addon_type === "balance_payment") return sum
+    return sum + addonAmount(addon)
   }, 0)
 
-  const paidAmount = Number(order.amount || 0) + paidAddonTotal
-  const totalOrderValue = basePrice + paidAddonTotal
+  const paidPostCheckoutAddonTotal = paidAddons.reduce((sum, addon) => {
+    if (addon.addon_type === "ultra_priority") return sum
+    return sum + addonAmount(addon)
+  }, 0)
+
+  const paidAmount = Number(order.amount || 0) + paidPostCheckoutAddonTotal
+  const totalOrderValue = editionBasePrice + orderValueAddonTotal
   const balanceDue = Math.max(0, totalOrderValue - paidAmount)
 
   await supabase
@@ -382,6 +412,7 @@ async function refreshOrderTotals(orderId) {
       total_order_value: totalOrderValue,
       paid_amount: paidAmount,
       balance_due: balanceDue,
+      pending_amount: balanceDue,
     })
     .eq("id", orderId)
 
@@ -796,6 +827,9 @@ app.post("/confirm-payment", async (req, res) => {
           total_order_value: totalOrderValue || null,
           paid_amount: amountToPay,
           balance_due: pendingAmount,
+          pending_amount: pendingAmount,
+          order_status: "story_pending",
+          production_status: "story_pending",
           name: customer.name,
           email: normalizedEmail,
           phone: customer.phone,
@@ -817,10 +851,13 @@ app.post("/confirm-payment", async (req, res) => {
       const { error: addonErr } = await supabase.from("order_addons").insert({
         order_id: insertedOrder.id,
         addon_type: "ultra_priority",
+        title: "Ultra Priority",
         description: "Ultra Priority",
         quantity: 1,
+        unit_price: ULTRA_PRIORITY_PRICE,
         amount: ULTRA_PRIORITY_PRICE,
         status: "paid",
+        payment_status: "paid",
         razorpay_order_id,
         razorpay_payment_id,
         paid_at: new Date().toISOString(),
@@ -1128,7 +1165,7 @@ app.get("/account/orders", async (req, res) => {
     const { data: orders, error: ordersErr } = await supabase
       .from("orders")
       .select(
-        "id, razorpay_order_id, edition, payment_type, amount, name, phone, email, address, created_at, story_submitted, total_order_value, paid_amount, balance_due"
+        "id, razorpay_order_id, edition, payment_type, amount, name, phone, email, address, created_at, story_submitted, total_order_value, paid_amount, balance_due, pending_amount, order_status, production_status"
       )
       .eq("email", customer.email)
       .order("created_at", { ascending: false })
@@ -1142,7 +1179,7 @@ app.get("/account/orders", async (req, res) => {
       ...order,
       total_order_value: order.total_order_value ?? order.amount ?? 0,
       paid_amount: order.paid_amount ?? order.amount ?? 0,
-      balance_due: order.balance_due ?? 0,
+      balance_due: order.balance_due ?? order.pending_amount ?? 0,
     }))
 
     return res.json({
@@ -1394,6 +1431,7 @@ app.get("/portal-order", async (req, res) => {
       deliverablesRes,
       revisionsRes,
       addonsRes,
+      reviewFilesRes,
     ] = await Promise.all([
       supabase.from("story_intakes").select("*").eq("order_id", order.id).order("updated_at", { ascending: false }),
       supabase.from("voice_notes").select("*").eq("order_id", order.id).order("created_at", { ascending: false }),
@@ -1401,6 +1439,7 @@ app.get("/portal-order", async (req, res) => {
       supabase.from("deliverables").select("*").eq("order_id", order.id).order("uploaded_at", { ascending: false }),
       supabase.from("revisions").select("*").eq("order_id", order.id).order("created_at", { ascending: false }),
       supabase.from("order_addons").select("*").eq("order_id", order.id).order("created_at", { ascending: false }),
+      supabase.from("review_files").select("*").eq("order_id", order.id).order("created_at", { ascending: false }),
     ])
 
     if (redirect) {
@@ -1426,6 +1465,7 @@ app.get("/portal-order", async (req, res) => {
         deliverables: deliverablesRes.data || [],
         revisions: revisionsRes.data || [],
         addons: addonsRes.data || [],
+        review_files: reviewFilesRes.data || [],
         limits: {
           included_voice_seconds: getIncludedVoiceSeconds(order.edition),
           review_timeline: getReviewTimeline(order.edition),
@@ -1453,6 +1493,7 @@ app.post("/story/create-addon-order", async (req, res) => {
     }
 
     const amount = getAddonAmount({ addonType, quantity, customAmount })
+    const qty = Math.max(1, Number(quantity || 1))
     const receipt = `ssl_addon_${Date.now()}`
 
     const razorpayOrder = await razorpay.orders.create({
@@ -1464,7 +1505,7 @@ app.post("/story/create-addon-order", async (req, res) => {
         orderId: order.id,
         razorpayOrderId: order.razorpay_order_id,
         addonType,
-        quantity: String(quantity || 1),
+        quantity: String(qty),
         amount: String(amount),
         customerEmail: order.email,
       },
@@ -1475,10 +1516,13 @@ app.post("/story/create-addon-order", async (req, res) => {
       .insert({
         order_id: order.id,
         addon_type: addonType,
+        title: description || addonType,
         description: description || null,
-        quantity: Number(quantity || 1),
+        quantity: qty,
+        unit_price: amount / qty,
         amount,
         status: "payment_created",
+        payment_status: "payment_created",
         razorpay_order_id: razorpayOrder.id,
         metadata: metadata || {},
       })
@@ -1527,7 +1571,9 @@ app.post("/story/confirm-addon-payment", async (req, res) => {
       .from("order_addons")
       .update({
         status: "paid",
+        payment_status: "paid",
         razorpay_payment_id,
+        razorpay_signature,
         paid_at: new Date().toISOString(),
       })
       .eq("razorpay_order_id", razorpay_order_id)
@@ -1553,8 +1599,34 @@ app.post("/story/confirm-addon-payment", async (req, res) => {
     if (addon.addon_type === "balance_payment") {
       await supabase
         .from("orders")
-        .update({ balance_due: 0, balance_paid_at: new Date().toISOString() })
+        .update({ balance_due: 0, pending_amount: 0, balance_paid_at: new Date().toISOString() })
         .eq("id", addon.order_id)
+    }
+
+    if (["extra_softcover_copy", "extra_hardcover_copy"].includes(addon.addon_type)) {
+      await supabase.from("print_addons").insert({
+        order_id: addon.order_id,
+        addon_id: addon.id,
+        addon_type: addon.addon_type,
+        quantity: Number(addon.quantity || 1),
+        amount: Number(addon.amount || 0),
+        payment_status: "paid",
+      })
+    }
+
+    if (addon.addon_type === "extra_polaroids_pack") {
+      const metadata = safeJsonObject(addon.metadata)
+      const photoPaths = Array.isArray(metadata.photo_paths) ? metadata.photo_paths : []
+
+      if (photoPaths.length > 0) {
+        await supabase.from("polaroid_photos").insert(
+          photoPaths.map((filePath) => ({
+            order_id: addon.order_id,
+            addon_id: addon.id,
+            file_path: String(filePath),
+          }))
+        )
+      }
     }
 
     await refreshOrderTotals(addon.order_id)
@@ -1699,10 +1771,10 @@ app.post("/story/register-voice-note", async (req, res) => {
 
     const { data: paidVoiceAddons } = await supabase
       .from("order_addons")
-      .select("quantity")
+      .select("quantity, status, payment_status")
       .eq("order_id", order.id)
       .eq("addon_type", "voice_note_hour")
-      .eq("status", "paid")
+      .or("status.eq.paid,payment_status.eq.paid")
 
     const paidSeconds = (paidVoiceAddons || []).reduce((sum, item) => sum + Number(item.quantity || 1) * 3600, 0)
     const allowedSeconds = includedSeconds + paidSeconds
@@ -1872,6 +1944,7 @@ app.post("/story/submit-intake", async (req, res) => {
         amount: 0,
         paid: true,
         status: "requested",
+        customer_note: callBooking.customerNote || null,
       })
     }
 
@@ -1882,6 +1955,7 @@ app.post("/story/submit-intake", async (req, res) => {
         story_submitted: true,
         story_submitted_at: new Date().toISOString(),
         production_status: "story_submitted",
+        order_status: "story_submitted",
       })
       .eq("id", order.id)
 
@@ -1968,6 +2042,7 @@ app.post("/submit-story", async (req, res) => {
         story_submitted: true,
         story_submitted_at: new Date().toISOString(),
         production_status: "story_submitted",
+        order_status: "story_submitted",
       })
       .eq("id", order.id)
 
@@ -2067,9 +2142,11 @@ app.post("/story/proceed-print", async (req, res) => {
     const order = await getOrderByIdOrRazorpay(orderId)
     if (!order) return res.status(404).json({ error: "Order not found" })
 
+    const now = new Date().toISOString()
+
     const { data, error } = await supabase
       .from("deliverables")
-      .update({ print_requested_at: new Date().toISOString() })
+      .update({ print_requested_at: now, status: "print_requested" })
       .eq("order_id", order.id)
       .select("*")
 
@@ -2079,8 +2156,19 @@ app.post("/story/proceed-print", async (req, res) => {
     }
 
     await supabase
+      .from("review_files")
+      .update({ approved_for_print_at: now, status: "approved_for_print" })
+      .eq("order_id", order.id)
+
+    await supabase
       .from("orders")
-      .update({ production_status: "print_requested", print_requested_at: new Date().toISOString() })
+      .update({
+        production_status: "print_requested",
+        order_status: "print_requested",
+        print_requested_at: now,
+        print_approved_at: now,
+        sent_to_print_at: now,
+      })
       .eq("id", order.id)
 
     await sendEmailSafe({
@@ -2290,8 +2378,10 @@ const ADMIN_ORDER_LIST_FIELDS = [
   "payment_type",
   "amount",
   "total_order_value",
+  "pending_amount",
   "paid_amount",
   "balance_due",
+  "balance_paid_at",
   "name",
   "phone",
   "email",
@@ -2300,35 +2390,17 @@ const ADMIN_ORDER_LIST_FIELDS = [
   "story",
   "story_submitted",
   "story_submitted_at",
+  "order_status",
   "production_status",
   "print_requested_at",
+  "print_approved_at",
+  "sent_to_print_at",
+  "latest_review_file_id",
   "custom_cover_paid",
   "voice_note_addon_paid",
 ].join(",")
 
-const ADMIN_ORDER_DETAIL_FIELDS = [
-  "id",
-  "razorpay_order_id",
-  "razorpay_payment_id",
-  "edition",
-  "payment_type",
-  "amount",
-  "total_order_value",
-  "paid_amount",
-  "balance_due",
-  "name",
-  "phone",
-  "email",
-  "address",
-  "created_at",
-  "story",
-  "story_submitted",
-  "story_submitted_at",
-  "production_status",
-  "print_requested_at",
-  "custom_cover_paid",
-  "voice_note_addon_paid",
-].join(",")
+const ADMIN_ORDER_DETAIL_FIELDS = ADMIN_ORDER_LIST_FIELDS
 
 app.post("/admin/login", adminAsync(async (req, res) => {
   const config = adminConfig()
@@ -2356,7 +2428,7 @@ app.get("/admin/dashboard", requireAdmin, adminAsync(async (req, res) => {
     supabase.from("orders").select("amount, paid_amount, story_submitted"),
     supabase.from("revisions").select("status"),
     supabase.from("deliverables").select("delivered_at"),
-    supabase.from("order_addons").select("amount, status"),
+    supabase.from("order_addons").select("amount, status, payment_status"),
   ])
 
   if (ordersResult.error) return adminHandleSupabaseError(res, ordersResult.error, "Unable to load dashboard orders.")
@@ -2376,7 +2448,7 @@ app.get("/admin/dashboard", requireAdmin, adminAsync(async (req, res) => {
   }, 0)
 
   const addonRevenue = addons
-    .filter((addon) => addon.status === "paid")
+    .filter((addon) => addonIsPaid(addon))
     .reduce((sum, addon) => {
       const amount = Number(addon.amount || 0)
       return Number.isFinite(amount) ? sum + amount : sum
@@ -2426,6 +2498,7 @@ app.get("/admin/orders/:id", requireAdmin, adminAsync(async (req, res) => {
     deliverablesResult,
     revisionsResult,
     addonsResult,
+    reviewFilesResult,
   ] = await Promise.all([
     supabase.from("story_intakes").select("*").eq("order_id", id).order("updated_at", { ascending: false }),
     supabase.from("voice_notes").select("*").eq("order_id", id).order("created_at", { ascending: false }),
@@ -2433,6 +2506,7 @@ app.get("/admin/orders/:id", requireAdmin, adminAsync(async (req, res) => {
     supabase.from("deliverables").select("*").eq("order_id", id).order("uploaded_at", { ascending: false }),
     supabase.from("revisions").select("*").eq("order_id", id).order("created_at", { ascending: false }),
     supabase.from("order_addons").select("*").eq("order_id", id).order("created_at", { ascending: false }),
+    supabase.from("review_files").select("*").eq("order_id", id).order("created_at", { ascending: false }),
   ])
 
   const relatedResults = [
@@ -2442,6 +2516,7 @@ app.get("/admin/orders/:id", requireAdmin, adminAsync(async (req, res) => {
     deliverablesResult,
     revisionsResult,
     addonsResult,
+    reviewFilesResult,
   ]
 
   const relatedError = relatedResults.find((result) => result.error)
@@ -2465,6 +2540,7 @@ app.get("/admin/orders/:id", requireAdmin, adminAsync(async (req, res) => {
       deliverables: deliverablesResult.data || [],
       revisions: revisionsResult.data || [],
       addons: addonsResult.data || [],
+      review_files: reviewFilesResult.data || [],
       ultra_priority: (addonsResult.data || []).some(addonLooksUltraPriority),
     },
   })
@@ -2601,9 +2677,6 @@ app.post("/admin/orders/:id/send-story-reminder", requireAdmin, adminAsync(async
   })
 }))
 
-
-
-
 app.patch("/admin/orders/:id", requireAdmin, adminAsync(async (req, res) => {
   const id = adminRequireUuid(req.params.id, "order id")
   const updates = {}
@@ -2616,10 +2689,12 @@ app.patch("/admin/orders/:id", requireAdmin, adminAsync(async (req, res) => {
   if (adminHasOwn(req.body, "payment_type")) updates.payment_type = adminStringOrNull(req.body.payment_type, "payment_type", 80)
   if (adminHasOwn(req.body, "amount")) updates.amount = adminNumberOrNull(req.body.amount, "amount")
   if (adminHasOwn(req.body, "total_order_value")) updates.total_order_value = adminNumberOrNull(req.body.total_order_value, "total_order_value")
+  if (adminHasOwn(req.body, "pending_amount")) updates.pending_amount = adminNumberOrNull(req.body.pending_amount, "pending_amount")
   if (adminHasOwn(req.body, "paid_amount")) updates.paid_amount = adminNumberOrNull(req.body.paid_amount, "paid_amount")
   if (adminHasOwn(req.body, "balance_due")) updates.balance_due = adminNumberOrNull(req.body.balance_due, "balance_due")
   if (adminHasOwn(req.body, "story_submitted")) updates.story_submitted = adminBoolean(req.body.story_submitted, "story_submitted")
   if (adminHasOwn(req.body, "production_status")) updates.production_status = adminStringOrNull(req.body.production_status, "production_status", 80)
+  if (adminHasOwn(req.body, "order_status")) updates.order_status = adminStringOrNull(req.body.order_status, "order_status", 80)
   if (adminHasOwn(req.body, "custom_cover_paid")) updates.custom_cover_paid = adminBoolean(req.body.custom_cover_paid, "custom_cover_paid")
   if (adminHasOwn(req.body, "voice_note_addon_paid")) updates.voice_note_addon_paid = adminBoolean(req.body.voice_note_addon_paid, "voice_note_addon_paid")
 
@@ -2689,7 +2764,8 @@ app.get("/admin/ultra-priority", requireAdmin, adminAsync(async (req, res) => {
   const ultraOrders = orders.filter((order) => {
     return (
       ultraOrderIds.has(order.id) ||
-      containsUltraPriority(order.production_status)
+      containsUltraPriority(order.production_status) ||
+      containsUltraPriority(order.order_status)
     )
   })
 
@@ -2728,15 +2804,47 @@ app.post("/admin/deliverables", requireAdmin, adminAsync(async (req, res) => {
 
   if (!pdfPath && !coverPath) return adminJsonError(res, 400, "PDF path or cover path is required.")
 
+  const now = new Date().toISOString()
+
+  const { data: reviewFile, error: reviewFileErr } = await supabase
+    .from("review_files")
+    .insert({
+      order_id: orderId,
+      manuscript_pdf_path: pdfPath,
+      cover_file_path: coverPath,
+      status: "sent_for_review",
+      sent_for_review_at: now,
+    })
+    .select("*")
+    .single()
+
+  if (reviewFileErr) {
+    console.error("Unable to create review file.", reviewFileErr)
+  }
+
   const { data, error } = await supabase
     .from("deliverables")
-    .insert({ order_id: orderId, pdf_path: pdfPath, cover_path: coverPath, uploaded_at: new Date().toISOString() })
+    .insert({
+      order_id: orderId,
+      pdf_path: pdfPath,
+      cover_path: coverPath,
+      uploaded_at: now,
+      review_file_id: reviewFile?.id || null,
+      status: "waiting_customer_review",
+    })
     .select("*")
     .single()
 
   if (error) return adminHandleSupabaseError(res, error, "Unable to create deliverable.")
 
-  await supabase.from("orders").update({ production_status: "review_ready" }).eq("id", orderId)
+  await supabase
+    .from("orders")
+    .update({
+      production_status: "review_ready",
+      order_status: "review_ready",
+      latest_review_file_id: reviewFile?.id || null,
+    })
+    .eq("id", orderId)
 
   const { data: order } = await supabase.from("orders").select("*").eq("id", orderId).single()
 
@@ -2757,7 +2865,7 @@ app.post("/admin/deliverables", requireAdmin, adminAsync(async (req, res) => {
     })
   }
 
-  return res.json({ success: true, deliverable: data })
+  return res.json({ success: true, deliverable: data, review_file: reviewFile || null })
 }))
 
 /* =========================
@@ -2774,3 +2882,4 @@ app.listen(PORT, () => {
   console.log(`✅ ADMIN API       = Enabled`)
   console.log(`✅ STORY API       = Enabled`)
 })
+```
