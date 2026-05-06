@@ -2470,6 +2470,77 @@ app.get("/admin/orders/:id", requireAdmin, adminAsync(async (req, res) => {
   })
 }))
 
+app.post("/admin/orders/:id/send-story-reminder", requireAdmin, adminAsync(async (req, res) => {
+  const id = adminRequireUuid(req.params.id, "order id")
+
+  const { data: order, error } = await supabase
+    .from("orders")
+    .select("id, razorpay_order_id, edition, name, email, phone, story_submitted")
+    .eq("id", id)
+    .single()
+
+  if (error || !order) {
+    if (error?.code === "PGRST116") return adminJsonError(res, 404, "Order not found.")
+    return adminHandleSupabaseError(res, error, "Unable to load order.")
+  }
+
+  if (order.story_submitted) {
+    return adminJsonError(res, 409, "Story has already been submitted.")
+  }
+
+  const customerEmail = normalizeEmail(order.email)
+
+  if (!customerEmail || !customerEmail.includes("@")) {
+    return adminJsonError(res, 400, "Customer email is missing or invalid.")
+  }
+
+  if (!order.razorpay_order_id) {
+    return adminJsonError(res, 400, "Razorpay order ID is missing.")
+  }
+
+  const portalUrl = `${PORTAL_BASE_URL}/story?order=${encodeURIComponent(order.razorpay_order_id)}`
+  const customerName = String(order.name || "").trim() || "there"
+
+  const sent = await sendEmailSafe({
+    to: customerEmail,
+    subject: "Complete your SoulScript Legacy story",
+    html: `
+      <div style="font-family: Arial, sans-serif; line-height:1.7;color:#111;">
+        <h2>Your story portal is waiting</h2>
+        <p>Dear ${escapeHtml(customerName)},</p>
+        <p>This is a gentle reminder to complete your SoulScript Legacy story submission.</p>
+        <p>Your ${escapeHtml(order.edition || "SoulScript Legacy edition")} can move into writing once your story details are shared.</p>
+        <p>
+          <a href="${portalUrl}" style="display:inline-block;background:#0E0E0E;color:#fff;padding:12px 16px;text-decoration:none;">
+            Open Story Portal
+          </a>
+        </p>
+        <p>If the button does not open, copy this link into your browser:</p>
+        <p style="word-break:break-all;color:#555;">${portalUrl}</p>
+        <p>Best regards,<br/>SoulScript Legacy</p>
+      </div>
+    `,
+  })
+
+  if (!sent.ok) {
+    return res.status(502).json({
+      success: false,
+      message: "Reminder email could not be sent.",
+      error: sent.error,
+      portalUrl,
+    })
+  }
+
+  return res.json({
+    success: true,
+    message: "Story reminder email sent.",
+    to: customerEmail,
+    portalUrl,
+  })
+}))
+
+
+
 app.patch("/admin/orders/:id", requireAdmin, adminAsync(async (req, res) => {
   const id = adminRequireUuid(req.params.id, "order id")
   const updates = {}
