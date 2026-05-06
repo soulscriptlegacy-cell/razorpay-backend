@@ -2309,14 +2309,16 @@ app.get("/admin/dashboard", requireAdmin, adminAsync(async (req, res) => {
   const closedRevisionStatuses = new Set(["complete", "completed", "done", "resolved", "cancelled", "canceled"])
 
   const orderRevenue = orders.reduce((sum, order) => {
-    const amount = Number(order.amount || 0)
+    const amount = Number(order.paid_amount || order.amount || 0)
     return Number.isFinite(amount) ? sum + amount : sum
   }, 0)
 
-  const addonRevenue = addons.filter((a) => a.status === "paid").reduce((sum, addon) => {
-    const amount = Number(addon.amount || 0)
-    return Number.isFinite(amount) ? sum + amount : sum
-  }, 0)
+  const addonRevenue = addons
+    .filter((addon) => addon.status === "paid")
+    .reduce((sum, addon) => {
+      const amount = Number(addon.amount || 0)
+      return Number.isFinite(amount) ? sum + amount : sum
+    }, 0)
 
   return res.json({
     success: true,
