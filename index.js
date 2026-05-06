@@ -535,6 +535,8 @@ async function sendAccountOtpForEmail(email, res) {
       <head>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <meta name="color-scheme" content="light only" />
+        <meta name="supported-color-schemes" content="light only" />
         <title>SoulScript Legacy Login Code</title>
       </head>
 
@@ -542,20 +544,20 @@ async function sendAccountOtpForEmail(email, res) {
         <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#f3f3f3;margin:0;padding:0;">
           <tr>
             <td align="center" style="padding:42px 16px;">
-              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width:600px;background:#ffffff;margin:0 auto;">
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width:600px;background:#ffffff;margin:0 auto;color:#111111;">
                 <tr>
-                  <td align="center" style="padding:46px 38px 52px;">
-                    <div style="font-family:Georgia, 'Times New Roman', serif;font-size:32px;font-weight:600;letter-spacing:8px;color:#000000;line-height:1;text-transform:uppercase;">
+                  <td align="center" style="padding:46px 38px 52px;background:#ffffff;color:#111111;">
+                    <div style="font-family:Georgia, 'Cormorant Garamond', 'Times New Roman', serif;font-size:20px;font-weight:500;letter-spacing:5px;color:#0E0E0E;line-height:1;text-transform:uppercase;">
                       SOULSCRIPT
                     </div>
 
-                    <div style="font-family:Arial, Helvetica, sans-serif;font-size:9px;letter-spacing:7px;color:#777777;line-height:1;text-transform:uppercase;margin-top:9px;">
+                    <div style="font-family:Arial, 'Jost', Helvetica, sans-serif;font-size:8.5px;font-weight:300;letter-spacing:5.5px;color:rgba(14,14,14,0.65);line-height:1;text-transform:uppercase;margin-top:7px;">
                       LEGACY
                     </div>
 
                     <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
                       <tr>
-                        <td style="padding-top:72px;text-align:left;">
+                        <td style="padding-top:72px;text-align:left;background:#ffffff;color:#111111;">
                           <div style="font-size:18px;line-height:1.4;font-weight:700;color:#111111;margin:0 0 46px;">
                             Profile code
                           </div>
