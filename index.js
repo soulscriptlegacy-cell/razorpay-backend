@@ -1314,7 +1314,67 @@ app.post("/story/confirm-addon-payment", async (req, res) => {
     return res.status(500).json({ error: "Add-on payment confirmation failed" })
   }
 })
+app.post("/story/save-cover-photo", async (req, res) => {
+  try {
+    const { orderId, photoPath } = req.body
 
+    const order = await getOrderByIdOrRazorpay(orderId)
+    if (!order) return res.status(404).json({ error: "Order not found" })
+
+    if (!photoPath) {
+      return res.status(400).json({ error: "photoPath required" })
+    }
+
+    const existing = await supabase
+      .from("story_intakes")
+      .select("id")
+      .eq("order_id", order.id)
+      .order("submitted_at", { ascending: false })
+      .limit(1)
+
+    const existingIntake = existing.data?.[0]
+
+    if (existingIntake) {
+      const { data, error } = await supabase
+        .from("story_intakes")
+        .update({
+          photo_path: photoPath,
+        })
+        .eq("id", existingIntake.id)
+        .select("*")
+        .single()
+
+      if (error) {
+        console.error("❌ Cover photo save failed:", error)
+        return res.status(500).json({ error: "Could not save cover photo" })
+      }
+
+      return res.json({ success: true, story_intake: data })
+    }
+
+    const { data, error } = await supabase
+      .from("story_intakes")
+      .insert({
+        order_id: order.id,
+        photo_path: photoPath,
+        text_story: order.story || "",
+        word_count: 0,
+        submitted_at: null,
+      })
+      .select("*")
+      .single()
+
+    if (error) {
+      console.error("❌ Cover photo insert failed:", error)
+      return res.status(500).json({ error: "Could not save cover photo" })
+    }
+
+    return res.json({ success: true, story_intake: data })
+  } catch (err) {
+    console.error("❌ /story/save-cover-photo error:", safeErr(err))
+    return res.status(500).json({ error: "Cover photo save failed" })
+  }
+})
 app.post("/story/save-draft", async (req, res) => {
   try {
     const { orderId, story } = req.body
