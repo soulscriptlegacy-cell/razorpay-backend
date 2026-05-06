@@ -458,7 +458,7 @@ app.post("/confirm-payment", async (req, res) => {
 
       console.log("📨 Admin order email sent")
     } catch (emailErr) {
-      console.error("❌ Admin email failed:", safeErr(emailErr))
+      console.error("❌ Admin order email failed:", safeErr(emailErr))
     }
 
     return res.json({
@@ -505,7 +505,9 @@ async function sendAccountOtpForEmail(email, res) {
 
   const otp = createOtp()
   const otpHash = hashOtp(cleanEmail, otp)
-  const expiresAt = new Date(Date.now() + OTP_EXPIRY_MINUTES * 60 * 1000).toISOString()
+  const expiresAt = new Date(
+    Date.now() + OTP_EXPIRY_MINUTES * 60 * 1000
+  ).toISOString()
 
   await supabase
     .from("customer_login_tokens")
@@ -528,27 +530,100 @@ async function sendAccountOtpForEmail(email, res) {
   }
 
   const html = `
-    <div style="font-family: Inter, Arial, sans-serif; line-height:1.6;">
-      <p>Hi,</p>
-      <p>Your SoulScript Legacy account login code is:</p>
+    <!doctype html>
+    <html>
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>SoulScript Legacy Login Code</title>
+      </head>
 
-      <div style="font-size:28px;letter-spacing:8px;font-weight:700;background:#f4f0e8;color:#111;padding:16px 18px;display:inline-block;border-radius:10px;margin:8px 0;">
-        ${otp}
-      </div>
+      <body style="margin:0;padding:0;background:#f3f3f3;font-family:Arial, Helvetica, sans-serif;color:#111111;">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#f3f3f3;margin:0;padding:0;">
+          <tr>
+            <td align="center" style="padding:42px 16px;">
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width:600px;background:#ffffff;margin:0 auto;">
+                <tr>
+                  <td align="center" style="padding:46px 38px 52px;">
+                    <div style="font-family:Georgia, 'Times New Roman', serif;font-size:32px;font-weight:600;letter-spacing:8px;color:#000000;line-height:1;text-transform:uppercase;">
+                      SOULSCRIPT
+                    </div>
 
-      <p style="color:#555;font-size:13px;">
-        This OTP expires in ${OTP_EXPIRY_MINUTES} minutes. Do not share this code with anyone.
-      </p>
+                    <div style="font-family:Arial, Helvetica, sans-serif;font-size:9px;letter-spacing:7px;color:#777777;line-height:1;text-transform:uppercase;margin-top:9px;">
+                      LEGACY
+                    </div>
 
-      <p>— SoulScript Legacy</p>
-    </div>
+                    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+                      <tr>
+                        <td style="padding-top:72px;text-align:left;">
+                          <div style="font-size:18px;line-height:1.4;font-weight:700;color:#111111;margin:0 0 46px;">
+                            Profile code
+                          </div>
+
+                          <div style="font-size:16px;line-height:1.7;color:#111111;margin:0 0 26px;">
+                            Dear SoulScript customer,
+                          </div>
+
+                          <div style="font-size:16px;line-height:1.7;color:#111111;margin:0 0 12px;">
+                            Below you can find the verification code:
+                          </div>
+
+                          <div style="font-size:26px;line-height:1.2;letter-spacing:2px;font-weight:400;color:#000000;margin:0 0 18px;">
+                            ${otp}
+                          </div>
+
+                          <div style="font-size:16px;line-height:1.7;color:#111111;margin:0 0 66px;">
+                            This code will expire in ${OTP_EXPIRY_MINUTES} minutes.
+                          </div>
+
+                          <div style="font-size:16px;line-height:1.35;color:#111111;margin:0 0 82px;">
+                            Best regards,<br />
+                            SoulScript Legacy
+                          </div>
+
+                          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="margin:0 0 58px;">
+                            <tr>
+                              <td align="left" style="width:50%;padding:0;">
+                                <a href="https://instagram.com/thesoulscriptlegacy" target="_blank" style="display:inline-block;text-decoration:none;color:#111111;font-size:13px;line-height:1;font-weight:700;margin-right:28px;">
+                                  Instagram
+                                </a>
+                              </td>
+
+                              <td align="left" style="width:50%;padding:0;">
+                                <a href="https://wa.me/918349614723" target="_blank" style="display:inline-block;text-decoration:none;color:#111111;font-size:13px;line-height:1;font-weight:700;">
+                                  WhatsApp Support
+                                </a>
+                              </td>
+                            </tr>
+                          </table>
+
+                          <div style="font-size:13px;line-height:1.6;color:#8a8a8a;margin:0;">
+                            <a href="${PORTAL_BASE_URL}/privacy" target="_blank" style="color:#8a8a8a;text-decoration:underline;">
+                              PRIVACY POLICY
+                            </a>
+                            <span style="color:#8a8a8a;"> · </span>
+                            <a href="${PORTAL_BASE_URL}/terms" target="_blank" style="color:#8a8a8a;text-decoration:underline;">
+                              Terms and Conditions
+                            </a>
+                          </div>
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      </body>
+    </html>
   `
 
   try {
     const r = await resend.emails.send({
       from: EMAIL_FROM,
       to: [cleanEmail],
-      subject: "Your SoulScript Legacy login code",
+      subject: "Your SoulScript Legacy profile code",
       html,
     })
 
