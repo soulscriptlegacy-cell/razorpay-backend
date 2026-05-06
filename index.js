@@ -7,6 +7,7 @@
 // - Existing routes preserved: dispatch hook, email debug, portal link, portal order, submit story
 // - Admin API added for SoulScript admin panel
 // - Story Portal API added for story intake, voice note add-ons, cover add-ons, balance payments, revisions, extra copies, polaroids
+// - Admin API aligned for Chandan operations panel with real Supabase field names
 
 const express = require("express")
 const Razorpay = require("razorpay")
@@ -127,6 +128,37 @@ function normalizeStringArray(value, fallback = [], maxItems = 3) {
   }
 
   return []
+}
+
+function safeJsonObject(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {}
+  return value
+}
+
+function containsUltraPriority(value) {
+  const text = String(value || "").toLowerCase()
+  return text.includes("ultra")
+}
+
+function addonLooksUltraPriority(addon) {
+  if (!addon) return false
+
+  const metadata = safeJsonObject(addon.metadata)
+  const metadataText = JSON.stringify(metadata).toLowerCase()
+
+  return (
+    containsUltraPriority(addon.addon_type) ||
+    containsUltraPriority(addon.description) ||
+    metadata.ultraPriority === true ||
+    metadata.ultraPriority === "true" ||
+    metadata.ultraPriority === "yes" ||
+    metadata.ultra_priority === true ||
+    metadata.ultra_priority === "true" ||
+    metadata.ultra_priority === "yes" ||
+    metadataText.includes("ultrapriority") ||
+    metadataText.includes("ultra_priority") ||
+    metadataText.includes("ultra priority")
+  )
 }
 
 async function sendEmailSafe({ to, subject, html }) {
@@ -779,6 +811,25 @@ app.post("/confirm-payment", async (req, res) => {
         error: "Payment verified but failed to save order",
         details: dbError,
       })
+    }
+
+    if (ultraPriority) {
+      const { error: addonErr } = await supabase.from("order_addons").insert({
+        order_id: insertedOrder.id,
+        addon_type: "ultra_priority",
+        description: "Ultra Priority",
+        quantity: 1,
+        amount: ULTRA_PRIORITY_PRICE,
+        status: "paid",
+        razorpay_order_id,
+        razorpay_payment_id,
+        paid_at: new Date().toISOString(),
+        metadata: { ultraPriority: true, source: "main_checkout" },
+      })
+
+      if (addonErr) {
+        console.error("⚠️ Ultra priority add-on insert failed:", addonErr)
+      }
     }
 
     console.log("✅ Order saved to Supabase:", razorpay_order_id)
@@ -2233,19 +2284,26 @@ function adminHandleSupabaseError(res, error, message = "Database request failed
 
 const ADMIN_ORDER_LIST_FIELDS = [
   "id",
-  "created_at",
-  "name",
-  "phone",
-  "email",
+  "razorpay_order_id",
+  "razorpay_payment_id",
   "edition",
   "payment_type",
   "amount",
   "total_order_value",
   "paid_amount",
   "balance_due",
+  "name",
+  "phone",
+  "email",
+  "address",
+  "created_at",
+  "story",
   "story_submitted",
-  "razorpay_order_id",
+  "story_submitted_at",
   "production_status",
+  "print_requested_at",
+  "custom_cover_paid",
+  "voice_note_addon_paid",
 ].join(",")
 
 const ADMIN_ORDER_DETAIL_FIELDS = [
@@ -2265,7 +2323,11 @@ const ADMIN_ORDER_DETAIL_FIELDS = [
   "created_at",
   "story",
   "story_submitted",
+  "story_submitted_at",
   "production_status",
+  "print_requested_at",
+  "custom_cover_paid",
+  "voice_note_addon_paid",
 ].join(",")
 
 app.post("/admin/login", adminAsync(async (req, res) => {
@@ -2338,8 +2400,13 @@ app.get("/admin/dashboard", requireAdmin, adminAsync(async (req, res) => {
 }))
 
 app.get("/admin/orders", requireAdmin, adminAsync(async (req, res) => {
-  const { data, error } = await supabase.from("orders").select(ADMIN_ORDER_LIST_FIELDS).order("created_at", { ascending: false })
+  const { data, error } = await supabase
+    .from("orders")
+    .select(ADMIN_ORDER_LIST_FIELDS)
+    .order("created_at", { ascending: false })
+
   if (error) return adminHandleSupabaseError(res, error, "Unable to load orders.")
+
   return res.json({ success: true, orders: data || [] })
 }))
 
@@ -2382,6 +2449,7 @@ app.get("/admin/orders/:id", requireAdmin, adminAsync(async (req, res) => {
 
   const storyIntakes = storyIntakesResult.data || []
   const activeStoryIntake =
+    storyIntakes.find((item) => item.submitted === true && item.submitted_at) ||
     storyIntakes.find((item) => item.submitted !== true && !item.submitted_at) ||
     storyIntakes[0] ||
     null
@@ -2397,6 +2465,7 @@ app.get("/admin/orders/:id", requireAdmin, adminAsync(async (req, res) => {
       deliverables: deliverablesResult.data || [],
       revisions: revisionsResult.data || [],
       addons: addonsResult.data || [],
+      ultra_priority: (addonsResult.data || []).some(addonLooksUltraPriority),
     },
   })
 }))
@@ -2407,12 +2476,18 @@ app.patch("/admin/orders/:id", requireAdmin, adminAsync(async (req, res) => {
 
   if (adminHasOwn(req.body, "name")) updates.name = adminStringOrNull(req.body.name, "name", 180)
   if (adminHasOwn(req.body, "phone")) updates.phone = adminStringOrNull(req.body.phone, "phone", 40)
+  if (adminHasOwn(req.body, "email")) updates.email = normalizeEmail(adminStringOrNull(req.body.email, "email", 320))
   if (adminHasOwn(req.body, "address")) updates.address = adminStringOrNull(req.body.address, "address", 2000)
   if (adminHasOwn(req.body, "edition")) updates.edition = adminStringOrNull(req.body.edition, "edition", 120)
   if (adminHasOwn(req.body, "payment_type")) updates.payment_type = adminStringOrNull(req.body.payment_type, "payment_type", 80)
   if (adminHasOwn(req.body, "amount")) updates.amount = adminNumberOrNull(req.body.amount, "amount")
+  if (adminHasOwn(req.body, "total_order_value")) updates.total_order_value = adminNumberOrNull(req.body.total_order_value, "total_order_value")
+  if (adminHasOwn(req.body, "paid_amount")) updates.paid_amount = adminNumberOrNull(req.body.paid_amount, "paid_amount")
+  if (adminHasOwn(req.body, "balance_due")) updates.balance_due = adminNumberOrNull(req.body.balance_due, "balance_due")
   if (adminHasOwn(req.body, "story_submitted")) updates.story_submitted = adminBoolean(req.body.story_submitted, "story_submitted")
   if (adminHasOwn(req.body, "production_status")) updates.production_status = adminStringOrNull(req.body.production_status, "production_status", 80)
+  if (adminHasOwn(req.body, "custom_cover_paid")) updates.custom_cover_paid = adminBoolean(req.body.custom_cover_paid, "custom_cover_paid")
+  if (adminHasOwn(req.body, "voice_note_addon_paid")) updates.voice_note_addon_paid = adminBoolean(req.body.voice_note_addon_paid, "voice_note_addon_paid")
 
   if (Object.keys(updates).length === 0) return adminJsonError(res, 400, "No allowed order fields provided.")
 
@@ -2459,6 +2534,36 @@ app.get("/admin/addons", requireAdmin, adminAsync(async (req, res) => {
   const { data, error } = await supabase.from("order_addons").select("*").order("created_at", { ascending: false })
   if (error) return adminHandleSupabaseError(res, error, "Unable to load add-ons.")
   return res.json({ success: true, addons: data || [] })
+}))
+
+app.get("/admin/ultra-priority", requireAdmin, adminAsync(async (req, res) => {
+  const [ordersResult, addonsResult] = await Promise.all([
+    supabase.from("orders").select(ADMIN_ORDER_LIST_FIELDS).order("created_at", { ascending: false }),
+    supabase.from("order_addons").select("*").order("created_at", { ascending: false }),
+  ])
+
+  if (ordersResult.error) return adminHandleSupabaseError(res, ordersResult.error, "Unable to load ultra priority orders.")
+  if (addonsResult.error) return adminHandleSupabaseError(res, addonsResult.error, "Unable to load ultra priority add-ons.")
+
+  const orders = ordersResult.data || []
+  const addons = addonsResult.data || []
+
+  const ultraOrderIds = new Set(
+    addons.filter(addonLooksUltraPriority).map((addon) => addon.order_id)
+  )
+
+  const ultraOrders = orders.filter((order) => {
+    return (
+      ultraOrderIds.has(order.id) ||
+      containsUltraPriority(order.production_status)
+    )
+  })
+
+  return res.json({
+    success: true,
+    orders: ultraOrders,
+    addons,
+  })
 }))
 
 app.patch("/admin/revisions/:id", requireAdmin, adminAsync(async (req, res) => {
