@@ -335,7 +335,7 @@ async function getStoryIntakesForOrder(orderId) {
     .from("story_intakes")
     .select("*")
     .eq("order_id", orderId)
-    .order("created_at", { ascending: false })
+    .order("updated_at", { ascending: false })
 
   if (error) {
     console.error("❌ getStoryIntakesForOrder failed:", error)
@@ -1243,7 +1243,7 @@ app.get("/portal-order", async (req, res) => {
     }
 
     const [storyIntakeRes, voiceNotesRes, callBookingsRes, deliverablesRes, revisionsRes, addonsRes] = await Promise.all([
-      supabase.from("story_intakes").select("*").eq("order_id", order.id).order("created_at", { ascending: false }),
+      supabase.from("story_intakes").select("*").eq("order_id", order.id).order("updated_at", { ascending: false }),
       supabase.from("voice_notes").select("*").eq("order_id", order.id).order("created_at", { ascending: false }),
       supabase.from("call_bookings").select("*").eq("order_id", order.id).order("created_at", { ascending: false }),
       supabase.from("deliverables").select("*").eq("order_id", order.id).order("uploaded_at", { ascending: false }),
@@ -2236,7 +2236,7 @@ app.get("/admin/orders/:id", requireAdmin, adminAsync(async (req, res) => {
   }
 
   const [storyIntakesResult, voiceNotesResult, callBookingsResult, deliverablesResult, revisionsResult, addonsResult] = await Promise.all([
-    supabase.from("story_intakes").select("*").eq("order_id", id).order("created_at", { ascending: false }),
+    supabase.from("story_intakes").select("*").eq("order_id", id).order("updated_at", { ascending: false }),
     supabase.from("voice_notes").select("*").eq("order_id", id).order("created_at", { ascending: false }),
     supabase.from("call_bookings").select("*").eq("order_id", id).order("created_at", { ascending: false }),
     supabase.from("deliverables").select("*").eq("order_id", id).order("uploaded_at", { ascending: false }),
@@ -2291,7 +2291,7 @@ app.patch("/admin/orders/:id", requireAdmin, adminAsync(async (req, res) => {
 }))
 
 app.get("/admin/story-intakes", requireAdmin, adminAsync(async (req, res) => {
-  const { data, error } = await supabase.from("story_intakes").select("*").order("created_at", { ascending: false })
+  const { data, error } = await supabase.from("story_intakes").select("*").order("updated_at", { ascending: false })
   if (error) return adminHandleSupabaseError(res, error, "Unable to load story intakes.")
   return res.json({ success: true, story_intakes: data || [] })
 }))
