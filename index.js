@@ -27,7 +27,7 @@ const app = express()
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 25 * 1024 * 1024 },
+limits: { fileSize: 50 * 1024 * 1024 },
 })
 
 /* =========================
@@ -41,7 +41,7 @@ app.use(
   })
 )
 
-app.use(express.json({ limit: "15mb" }))
+app.use(express.json({ limit: "50mb" }))
 
 /* =========================
    HELPERS
@@ -523,20 +523,20 @@ async function withSignedStoryIntake(intake) {
     intake.photo_path
   )
 
-  const coverPhotoUrl = await createSignedUrlWithFallback(
-    [STORAGE_BUCKETS.coverPhotos, STORAGE_BUCKETS.coverReferences],
-    coverPhotoPath
-  )
+const coverPhotoUrl = await createSignedUrlWithFallback(
+  [STORAGE_BUCKETS.reviewMedia, STORAGE_BUCKETS.coverPhotos, STORAGE_BUCKETS.coverReferences],
+  coverPhotoPath
+)
 
   const referencePaths = normalizeStoragePathArray(intake.reference_image_paths, 20)
   const referenceImages = await Promise.all(
     referencePaths.map(async (path) => ({
       file_path: path,
       path,
-      signed_url: await createSignedUrlWithFallback(
-        [STORAGE_BUCKETS.coverReferences, STORAGE_BUCKETS.coverPhotos],
-        path
-      ),
+ signed_url: await createSignedUrlWithFallback(
+  [STORAGE_BUCKETS.reviewMedia, STORAGE_BUCKETS.coverReferences, STORAGE_BUCKETS.coverPhotos],
+  path
+),
     }))
   )
 
@@ -558,10 +558,10 @@ async function withSignedCoverReferenceImages(images = []) {
   return Promise.all(
     (images || []).map(async (image) => ({
       ...image,
-      signed_url: await createSignedUrlWithFallback(
-        [STORAGE_BUCKETS.coverReferences, STORAGE_BUCKETS.coverPhotos],
-        image.file_path
-      ),
+  signed_url: await createSignedUrlWithFallback(
+  [STORAGE_BUCKETS.reviewMedia, STORAGE_BUCKETS.coverReferences, STORAGE_BUCKETS.coverPhotos],
+  path
+),
     }))
   )
 }
