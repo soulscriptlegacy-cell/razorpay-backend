@@ -1,3 +1,12 @@
+Yes. Use this full corrected `index.js`.
+
+Important: add `multer` on Render before deploying:
+
+```bash
+npm install multer
+```
+
+```js
 // index.js (SoulScript Legacy backend)
 // Checkout upgraded:
 // - Backend calculates prices safely
@@ -9,15 +18,24 @@
 // - Story Portal API added for story intake, voice note add-ons, cover add-ons, balance payments, revisions, extra copies, polaroids
 // - Admin API aligned for Chandan operations panel with real Supabase field names
 // - All customer/admin emails use one polished SoulScript branded email UI
+// - Private Supabase Storage files are served through signed URLs
+// - Chandan manager route added with safe operational data only
+// - Review files can be uploaded directly from admin panel
 
 const express = require("express")
 const Razorpay = require("razorpay")
 const crypto = require("crypto")
 const cors = require("cors")
+const multer = require("multer")
 const { Resend } = require("resend")
 const { createClient } = require("@supabase/supabase-js")
 
 const app = express()
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024 },
+})
 
 /* =========================
    BASIC MIDDLEWARE
@@ -130,6 +148,29 @@ function normalizeStringArray(value, fallback = [], maxItems = 3) {
       .map((item) => String(item || "").trim())
       .filter(Boolean)
       .slice(0, maxItems)
+  }
+
+  return []
+}
+
+function normalizeStoragePathArray(value, maxItems = 20) {
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => String(item || "").trim())
+      .filter(Boolean)
+      .slice(0, maxItems)
+  }
+
+  if (typeof value === "string") {
+    const trimmed = value.trim()
+    if (!trimmed) return []
+
+    try {
+      const parsed = JSON.parse(trimmed)
+      if (Array.isArray(parsed)) return normalizeStoragePathArray(parsed, maxItems)
+    } catch {}
+
+    return [trimmed].slice(0, maxItems)
   }
 
   return []
@@ -337,6 +378,306 @@ const supabase = createClient(
   must("SUPABASE_URL"),
   must("SUPABASE_SERVICE_ROLE_KEY")
 )
+
+/* =========================
+   STORAGE
+========================= */
+const STORAGE_BUCKETS = {
+  voiceNotes: process.env.SUPABASE_VOICE_NOTES_BUCKET || "order_voice_notes",
+  coverPhotos: process.env.SUPABASE_COVER_PHOTOS_BUCKET || "cover-photos",
+  coverReferences:
+    process.env.SUPABASE_COVER_REFERENCES_BUCKET || "cover-references",
+  reviewFiles: process.env.SUPABASE_REVIEW_FILES_BUCKET || "review-files",
+  reviewMedia: process.env.SUPABASE_REVIEW_MEDIA_BUCKET || "review-media",
+  polaroids: process.env.SUPABASE_POLAROIDS_BUCKET || "polaroid-photos",
+}
+
+function cleanStoragePath(path) {
+  const text = String(path || "").trim()
+  if (!text) return ""
+  if (/^https?:\/\//i.test(text)) return text
+  return text.replace(/^\/+/, "")
+}
+
+async function createSignedUrl(bucket, path, expiresInSeconds = 3600) {
+  const cleanBucket = String(bucket || "").trim()
+  const cleanPath = cleanStoragePath(path)
+
+  if (!cleanBucket || !cleanPath) return null
+  if (/^https?:\/\//i.test(cleanPath)) return cleanPath
+
+  try {
+    const { data, error } = await supabase.storage
+      .from(cleanBucket)
+      .createSignedUrl(cleanPath, expiresInSeconds)
+
+    if (error) {
+      console.error("⚠️ Signed URL failed:", {
+        bucket: cleanBucket,
+        path: cleanPath,
+        error,
+      })
+      return null
+    }
+
+    return data?.signedUrl || null
+  } catch (error) {
+    console.error("⚠️ Signed URL exception:", {
+      bucket: cleanBucket,
+      path: cleanPath,
+      error: safeErr(error),
+    })
+    return null
+  }
+}
+
+async function createSignedUrlWithFallback(buckets, path, expiresInSeconds = 3600) {
+  const bucketList = Array.isArray(buckets) ? buckets : [buckets]
+
+  for (const bucket of bucketList) {
+    const signedUrl = await createSignedUrl(bucket, path, expiresInSeconds)
+    if (signedUrl) return signedUrl
+  }
+
+  return null
+}
+
+async function createSignedUrlsForPaths(bucket, paths, expiresInSeconds = 3600) {
+  const cleanPaths = normalizeStoragePathArray(paths)
+  return Promise.all(
+    cleanPaths.map(async (path) => ({
+      path,
+      signed_url: await createSignedUrl(bucket, path, expiresInSeconds),
+    }))
+  )
+}
+
+async function getPublicOrSignedStorageUrl(bucket, path, expiresInSeconds = 3600) {
+  const cleanPath = cleanStoragePath(path)
+  if (!cleanPath) return null
+  if (/^https?:\/\//i.test(cleanPath)) return cleanPath
+  return createSignedUrl(bucket, cleanPath, expiresInSeconds)
+}
+
+async function withSignedVoiceNotes(voiceNotes = []) {
+  return Promise.all(
+    (voiceNotes || []).map(async (note) => {
+      const signedUrl = await createSignedUrl(
+        STORAGE_BUCKETS.voiceNotes,
+        note.file_path
+      )
+
+      return {
+        ...note,
+        signed_url: signedUrl,
+        playable_url: signedUrl,
+      }
+    })
+  )
+}
+
+async function withSignedReviewFiles(reviewFiles = []) {
+  return Promise.all(
+    (reviewFiles || []).map(async (file) => {
+      const manuscriptUrl = await createSignedUrl(
+        STORAGE_BUCKETS.reviewFiles,
+        file.manuscript_pdf_path
+      )
+
+      const coverUrl = await createSignedUrl(
+        STORAGE_BUCKETS.reviewFiles,
+        file.cover_file_path
+      )
+
+      return {
+        ...file,
+        manuscript_pdf_signed_url: manuscriptUrl,
+        manuscript_pdf_url: manuscriptUrl,
+        cover_file_signed_url: coverUrl,
+        cover_file_url: coverUrl,
+      }
+    })
+  )
+}
+
+async function withSignedDeliverables(deliverables = []) {
+  return Promise.all(
+    (deliverables || []).map(async (item) => {
+      const pdfUrl = await createSignedUrl(
+        STORAGE_BUCKETS.reviewFiles,
+        item.pdf_path
+      )
+
+      const coverUrl = await createSignedUrl(
+        STORAGE_BUCKETS.reviewFiles,
+        item.cover_path
+      )
+
+      return {
+        ...item,
+        pdf_signed_url: pdfUrl,
+        cover_signed_url: coverUrl,
+      }
+    })
+  )
+}
+
+async function withSignedStoryIntake(intake) {
+  if (!intake) return null
+
+  const coverPhotoPath = firstNonEmpty(
+    intake.cover_photo_path,
+    intake.photo_path
+  )
+
+  const coverPhotoUrl = await createSignedUrlWithFallback(
+    [STORAGE_BUCKETS.coverPhotos, STORAGE_BUCKETS.coverReferences],
+    coverPhotoPath
+  )
+
+  const referencePaths = normalizeStoragePathArray(intake.reference_image_paths, 20)
+  const referenceImages = await Promise.all(
+    referencePaths.map(async (path) => ({
+      file_path: path,
+      path,
+      signed_url: await createSignedUrlWithFallback(
+        [STORAGE_BUCKETS.coverReferences, STORAGE_BUCKETS.coverPhotos],
+        path
+      ),
+    }))
+  )
+
+  return {
+    ...intake,
+    cover_photo_signed_url: coverPhotoUrl,
+    cover_photo: coverPhotoPath
+      ? {
+          file_path: coverPhotoPath,
+          signed_url: coverPhotoUrl,
+        }
+      : null,
+    reference_image_signed_urls: referenceImages.map((item) => item.signed_url).filter(Boolean),
+    reference_images: referenceImages,
+  }
+}
+
+async function withSignedCoverReferenceImages(images = []) {
+  return Promise.all(
+    (images || []).map(async (image) => ({
+      ...image,
+      signed_url: await createSignedUrlWithFallback(
+        [STORAGE_BUCKETS.coverReferences, STORAGE_BUCKETS.coverPhotos],
+        image.file_path
+      ),
+    }))
+  )
+}
+
+async function withSignedPolaroids(images = []) {
+  return Promise.all(
+    (images || []).map(async (image) => ({
+      ...image,
+      signed_url: await createSignedUrl(
+        STORAGE_BUCKETS.polaroids,
+        image.file_path
+      ),
+    }))
+  )
+}
+
+function safeFileName(name) {
+  const fallback = `file-${Date.now()}`
+  const clean = String(name || fallback)
+    .trim()
+    .replace(/[/\\]/g, "-")
+    .replace(/[^a-zA-Z0-9._-]/g, "-")
+    .replace(/-+/g, "-")
+    .slice(0, 140)
+
+  return clean || fallback
+}
+
+function fileExtensionFor(file, fallback = "bin") {
+  const name = String(file?.originalname || "")
+  const ext = name.includes(".") ? name.split(".").pop().toLowerCase() : ""
+  if (ext) return ext
+
+  if (file?.mimetype === "application/pdf") return "pdf"
+  if (file?.mimetype === "image/jpeg") return "jpg"
+  if (file?.mimetype === "image/png") return "png"
+  if (file?.mimetype === "image/webp") return "webp"
+
+  return fallback
+}
+
+function uploadedFile(req, names) {
+  for (const name of names) {
+    const value = req.files?.[name]
+    if (Array.isArray(value) && value[0]) return value[0]
+  }
+  return null
+}
+
+async function getNextReviewVersion(orderId) {
+  const { data, error } = await supabase
+    .from("review_files")
+    .select("version_number")
+    .eq("order_id", orderId)
+    .order("version_number", { ascending: false })
+    .limit(1)
+
+  if (error) {
+    console.error("⚠️ Failed to get next review version:", error)
+    return 1
+  }
+
+  const current = Number(data?.[0]?.version_number || 0)
+  return Number.isFinite(current) ? current + 1 : 1
+}
+
+async function uploadReviewStorageFile(orderId, versionNumber, file, label) {
+  if (!file) return null
+
+  const timestamp = Date.now()
+  const extension = fileExtensionFor(file)
+  const name = safeFileName(file.originalname || `${label}.${extension}`)
+  const path = `${orderId}/reviews/version-${versionNumber}/${label}-${timestamp}-${name}`
+
+  const { error } = await supabase.storage
+    .from(STORAGE_BUCKETS.reviewFiles)
+    .upload(path, file.buffer, {
+      contentType: file.mimetype || "application/octet-stream",
+      upsert: false,
+    })
+
+  if (error) {
+    console.error("❌ Review file upload failed:", {
+      bucket: STORAGE_BUCKETS.reviewFiles,
+      path,
+      error,
+    })
+    throw new AdminInputError(`Could not upload ${label} file.`)
+  }
+
+  return path
+}
+
+function sanitizeManagerAddon(addon) {
+  return {
+    id: addon.id,
+    order_id: addon.order_id,
+    addon_type: addon.addon_type,
+    title: addon.title,
+    description: addon.description,
+    quantity: addon.quantity,
+    unit_price: addon.unit_price,
+    amount: addon.amount,
+    status: addon.status,
+    payment_status: addon.payment_status,
+    paid_at: addon.paid_at,
+    created_at: addon.created_at,
+  }
+}
 
 /* =========================
    RESEND
@@ -769,6 +1110,7 @@ app.get("/health", (req, res) => {
     addOns: ADDON_PRICES,
     accountLogin: "email_otp",
     otpExpiryMinutes: OTP_EXPIRY_MINUTES,
+    storageBuckets: STORAGE_BUCKETS,
   })
 })
 
@@ -1017,7 +1359,7 @@ app.post("/confirm-payment", async (req, res) => {
       html: brandedEmailTemplate({
         title: "New order confirmed",
         bodyHtml:
-          emailParagraph(`A new SoulScript Legacy order has been confirmed.`) +
+          emailParagraph("A new SoulScript Legacy order has been confirmed.") +
           emailDetails([
             { label: "Edition", value: edition },
             { label: "Payment type", value: normalizedPaymentType === "PREPAID" ? "Paid in full" : "50% Advance" },
@@ -1037,7 +1379,7 @@ app.post("/confirm-payment", async (req, res) => {
 
     await sendEmailSafe({
       to: normalizedEmail,
-      subject: `Your SoulScript Legacy order is confirmed`,
+      subject: "Your SoulScript Legacy order is confirmed",
       html: brandedEmailTemplate({
         title: "Order confirmed",
         bodyHtml:
@@ -1481,7 +1823,7 @@ app.post("/send-portal-link", async (req, res) => {
       html: brandedEmailTemplate({
         title: "Portal link fallback",
         bodyHtml:
-          emailParagraph(`Resend could not send directly to this customer.`) +
+          emailParagraph("Resend could not send directly to this customer.") +
           emailDetails([
             { label: "Customer email", value: normalizedEmail },
             { label: "Portal URL", value: portalUrl },
@@ -1582,6 +1924,13 @@ app.get("/portal-order", async (req, res) => {
       (storyIntakeRes.data || [])[0] ||
       null
 
+    const signedDeliverables = await withSignedDeliverables(deliverablesRes.data || [])
+    const signedReviewFiles = await withSignedReviewFiles(reviewFilesRes.data || [])
+    const latestReviewFile =
+      signedReviewFiles.find((item) => item.id === order.latest_review_file_id) ||
+      signedReviewFiles[0] ||
+      null
+
     return res.json({
       success: true,
       order: {
@@ -1590,10 +1939,11 @@ app.get("/portal-order", async (req, res) => {
         story_intakes: storyIntakeRes.data || [],
         voice_notes: voiceNotesRes.data || [],
         call_bookings: callBookingsRes.data || [],
-        deliverables: deliverablesRes.data || [],
+        deliverables: signedDeliverables,
         revisions: revisionsRes.data || [],
         addons: addonsRes.data || [],
-        review_files: reviewFilesRes.data || [],
+        review_files: signedReviewFiles,
+        latest_review_file: latestReviewFile,
         limits: {
           included_voice_seconds: getIncludedVoiceSeconds(order.edition),
           review_timeline: getReviewTimeline(order.edition),
@@ -1977,7 +2327,7 @@ app.post("/story/delete-voice-note", async (req, res) => {
 
     if (voiceNote.file_path) {
       const { error: storageErr } = await supabase.storage
-        .from("order_voice_notes")
+        .from(STORAGE_BUCKETS.voiceNotes)
         .remove([voiceNote.file_path])
 
       if (storageErr) {
@@ -2117,7 +2467,7 @@ app.post("/story/submit-intake", async (req, res) => {
             { label: "Note to writer", value: nl2br(cleanNoteToWriter), html: true },
           ]) +
           emailDivider() +
-          emailParagraph(`<strong>Story</strong>`) +
+          emailParagraph("<strong>Story</strong>") +
           emailMuted(nl2br(cleanStory)),
       }),
     })
@@ -2198,7 +2548,7 @@ app.post("/submit-story", async (req, res) => {
             { label: "Phone", value: order.phone },
           ]) +
           emailDivider() +
-          emailParagraph(`<strong>Story</strong>`) +
+          emailParagraph("<strong>Story</strong>") +
           emailMuted(nl2br(cleanStory)),
       }),
     })
@@ -2360,7 +2710,7 @@ const ADMIN_ALLOWED_ORIGINS = new Set([
 
 const ADMIN_TOKEN_TTL_SECONDS = 60 * 60 * 12
 const ADMIN_UUID_RE =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{12}$/i
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
 class AdminInputError extends Error {
   constructor(message) {
@@ -2517,6 +2867,24 @@ function adminHandleSupabaseError(res, error, message = "Database request failed
   return adminJsonError(res, 500, message)
 }
 
+const uploadReviewFilesMiddleware = upload.fields([
+  { name: "manuscript_pdf", maxCount: 1 },
+  { name: "cover_file", maxCount: 1 },
+  { name: "manuscriptPdf", maxCount: 1 },
+  { name: "coverFile", maxCount: 1 },
+  { name: "pdf", maxCount: 1 },
+  { name: "cover", maxCount: 1 },
+])
+
+function adminUploadReviewFiles(req, res, next) {
+  uploadReviewFilesMiddleware(req, res, (error) => {
+    if (!error) return next()
+
+    console.error("❌ Admin upload middleware failed:", safeErr(error))
+    return adminJsonError(res, 400, error?.message || "File upload failed.")
+  })
+}
+
 const ADMIN_ORDER_LIST_FIELDS = [
   "id",
   "razorpay_order_id",
@@ -2548,6 +2916,30 @@ const ADMIN_ORDER_LIST_FIELDS = [
 ].join(",")
 
 const ADMIN_ORDER_DETAIL_FIELDS = ADMIN_ORDER_LIST_FIELDS
+
+const MANAGER_ORDER_FIELDS = [
+  "id",
+  "edition",
+  "payment_type",
+  "amount",
+  "paid_amount",
+  "balance_due",
+  "pending_amount",
+  "name",
+  "phone",
+  "email",
+  "address",
+  "created_at",
+  "story",
+  "story_submitted",
+  "story_submitted_at",
+  "order_status",
+  "production_status",
+  "print_requested_at",
+  "latest_review_file_id",
+  "custom_cover_paid",
+  "voice_note_addon_paid",
+].join(",")
 
 app.post("/admin/login", adminAsync(async (req, res) => {
   const config = adminConfig()
@@ -2629,6 +3021,178 @@ app.get("/admin/orders", requireAdmin, adminAsync(async (req, res) => {
   return res.json({ success: true, orders: data || [] })
 }))
 
+app.get("/admin/storage/signed-url", requireAdmin, adminAsync(async (req, res) => {
+  const bucket = String(req.query.bucket || "").trim()
+  const path = String(req.query.path || "").trim()
+
+  if (!bucket) return adminJsonError(res, 400, "bucket is required.")
+  if (!path) return adminJsonError(res, 400, "path is required.")
+
+  const allowedBuckets = new Set(Object.values(STORAGE_BUCKETS))
+  if (!allowedBuckets.has(bucket)) {
+    return adminJsonError(res, 400, "Storage bucket is not allowed.")
+  }
+
+  const signedUrl = await createSignedUrl(bucket, path)
+  if (!signedUrl) return adminJsonError(res, 404, "Could not create signed URL.")
+
+  return res.json({ success: true, signedUrl })
+}))
+
+app.get("/admin/orders/:id/files", requireAdmin, adminAsync(async (req, res) => {
+  const id = adminRequireUuid(req.params.id, "order id")
+
+  const [
+    orderResult,
+    storyIntakesResult,
+    voiceNotesResult,
+    coverReferencesResult,
+    polaroidsResult,
+    deliverablesResult,
+    reviewFilesResult,
+  ] = await Promise.all([
+    supabase.from("orders").select("id, name, email, phone, edition").eq("id", id).single(),
+    supabase.from("story_intakes").select("*").eq("order_id", id).order("updated_at", { ascending: false }),
+    supabase.from("voice_notes").select("*").eq("order_id", id).order("created_at", { ascending: false }),
+    supabase.from("cover_reference_images").select("*").eq("order_id", id).order("created_at", { ascending: false }),
+    supabase.from("polaroid_photos").select("*").eq("order_id", id).order("created_at", { ascending: false }),
+    supabase.from("deliverables").select("*").eq("order_id", id).order("uploaded_at", { ascending: false }),
+    supabase.from("review_files").select("*").eq("order_id", id).order("created_at", { ascending: false }),
+  ])
+
+  if (orderResult.error) {
+    if (orderResult.error.code === "PGRST116") return adminJsonError(res, 404, "Order not found.")
+    return adminHandleSupabaseError(res, orderResult.error, "Unable to load order.")
+  }
+
+  const relatedError = [
+    storyIntakesResult,
+    voiceNotesResult,
+    coverReferencesResult,
+    polaroidsResult,
+    deliverablesResult,
+    reviewFilesResult,
+  ].find((result) => result.error)
+
+  if (relatedError) return adminHandleSupabaseError(res, relatedError.error, "Unable to load order files.")
+
+  const storyIntakes = await Promise.all(
+    (storyIntakesResult.data || []).map((intake) => withSignedStoryIntake(intake))
+  )
+
+  return res.json({
+    success: true,
+    order: orderResult.data,
+    files: {
+      story_intakes: storyIntakes,
+      voice_notes: await withSignedVoiceNotes(voiceNotesResult.data || []),
+      cover_reference_images: await withSignedCoverReferenceImages(coverReferencesResult.data || []),
+      polaroid_photos: await withSignedPolaroids(polaroidsResult.data || []),
+      deliverables: await withSignedDeliverables(deliverablesResult.data || []),
+      review_files: await withSignedReviewFiles(reviewFilesResult.data || []),
+    },
+  })
+}))
+
+app.get("/admin/manager/orders/:id", requireAdmin, adminAsync(async (req, res) => {
+  const id = adminRequireUuid(req.params.id, "order id")
+
+  const orderResult = await supabase
+    .from("orders")
+    .select(MANAGER_ORDER_FIELDS)
+    .eq("id", id)
+    .single()
+
+  if (orderResult.error) {
+    if (orderResult.error.code === "PGRST116") return adminJsonError(res, 404, "Order not found.")
+    return adminHandleSupabaseError(res, orderResult.error, "Unable to load manager order.")
+  }
+
+  const [
+    storyIntakesResult,
+    voiceNotesResult,
+    coverReferencesResult,
+    callBookingsResult,
+    deliverablesResult,
+    revisionsResult,
+    addonsResult,
+    reviewFilesResult,
+    polaroidsResult,
+  ] = await Promise.all([
+    supabase.from("story_intakes").select("*").eq("order_id", id).order("updated_at", { ascending: false }),
+    supabase.from("voice_notes").select("*").eq("order_id", id).order("created_at", { ascending: false }),
+    supabase.from("cover_reference_images").select("*").eq("order_id", id).order("created_at", { ascending: false }),
+    supabase.from("call_bookings").select("*").eq("order_id", id).order("created_at", { ascending: false }),
+    supabase.from("deliverables").select("*").eq("order_id", id).order("uploaded_at", { ascending: false }),
+    supabase.from("revisions").select("*").eq("order_id", id).order("created_at", { ascending: false }),
+    supabase.from("order_addons").select("*").eq("order_id", id).order("created_at", { ascending: false }),
+    supabase.from("review_files").select("*").eq("order_id", id).order("created_at", { ascending: false }),
+    supabase.from("polaroid_photos").select("*").eq("order_id", id).order("created_at", { ascending: false }),
+  ])
+
+  const relatedError = [
+    storyIntakesResult,
+    voiceNotesResult,
+    coverReferencesResult,
+    callBookingsResult,
+    deliverablesResult,
+    revisionsResult,
+    addonsResult,
+    reviewFilesResult,
+    polaroidsResult,
+  ].find((result) => result.error)
+
+  if (relatedError) return adminHandleSupabaseError(res, relatedError.error, "Unable to load manager order data.")
+
+  const storyIntakes = storyIntakesResult.data || []
+  const activeStoryIntake =
+    storyIntakes.find((item) => item.submitted === true && item.submitted_at) ||
+    storyIntakes.find((item) => item.submitted !== true && !item.submitted_at) ||
+    storyIntakes[0] ||
+    null
+
+  const signedStoryIntake = await withSignedStoryIntake(activeStoryIntake)
+  const signedCoverReferences = await withSignedCoverReferenceImages(coverReferencesResult.data || [])
+  const referenceImagesFromIntake = signedStoryIntake?.reference_images || []
+  const referenceImages = [
+    ...referenceImagesFromIntake,
+    ...signedCoverReferences.map((image) => ({
+      id: image.id,
+      file_path: image.file_path,
+      file_name: image.file_name,
+      signed_url: image.signed_url,
+      created_at: image.created_at,
+    })),
+  ]
+
+  const signedReviewFiles = await withSignedReviewFiles(reviewFilesResult.data || [])
+  const signedDeliverables = await withSignedDeliverables(deliverablesResult.data || [])
+  const latestReviewFile =
+    signedReviewFiles.find((item) => item.id === orderResult.data.latest_review_file_id) ||
+    signedReviewFiles[0] ||
+    null
+
+  return res.json({
+    success: true,
+    order: {
+      ...orderResult.data,
+      story_intake: signedStoryIntake,
+      story_intakes: await Promise.all(storyIntakes.map((intake) => withSignedStoryIntake(intake))),
+      cover_photo: signedStoryIntake?.cover_photo || null,
+      reference_images: referenceImages,
+      voice_notes: await withSignedVoiceNotes(voiceNotesResult.data || []),
+      call_bookings: callBookingsResult.data || [],
+      deliverables: signedDeliverables,
+      revisions: revisionsResult.data || [],
+      addons: (addonsResult.data || []).map(sanitizeManagerAddon),
+      review_files: signedReviewFiles,
+      latest_review_file: latestReviewFile,
+      polaroid_photos: await withSignedPolaroids(polaroidsResult.data || []),
+      ultra_priority: (addonsResult.data || []).some(addonLooksUltraPriority),
+    },
+  })
+}))
+
 app.get("/admin/orders/:id", requireAdmin, adminAsync(async (req, res) => {
   const id = adminRequireUuid(req.params.id, "order id")
 
@@ -2641,29 +3205,35 @@ app.get("/admin/orders/:id", requireAdmin, adminAsync(async (req, res) => {
   const [
     storyIntakesResult,
     voiceNotesResult,
+    coverReferencesResult,
     callBookingsResult,
     deliverablesResult,
     revisionsResult,
     addonsResult,
     reviewFilesResult,
+    polaroidsResult,
   ] = await Promise.all([
     supabase.from("story_intakes").select("*").eq("order_id", id).order("updated_at", { ascending: false }),
     supabase.from("voice_notes").select("*").eq("order_id", id).order("created_at", { ascending: false }),
+    supabase.from("cover_reference_images").select("*").eq("order_id", id).order("created_at", { ascending: false }),
     supabase.from("call_bookings").select("*").eq("order_id", id).order("created_at", { ascending: false }),
     supabase.from("deliverables").select("*").eq("order_id", id).order("uploaded_at", { ascending: false }),
     supabase.from("revisions").select("*").eq("order_id", id).order("created_at", { ascending: false }),
     supabase.from("order_addons").select("*").eq("order_id", id).order("created_at", { ascending: false }),
     supabase.from("review_files").select("*").eq("order_id", id).order("created_at", { ascending: false }),
+    supabase.from("polaroid_photos").select("*").eq("order_id", id).order("created_at", { ascending: false }),
   ])
 
   const relatedResults = [
     storyIntakesResult,
     voiceNotesResult,
+    coverReferencesResult,
     callBookingsResult,
     deliverablesResult,
     revisionsResult,
     addonsResult,
     reviewFilesResult,
+    polaroidsResult,
   ]
 
   const relatedError = relatedResults.find((result) => result.error)
@@ -2676,18 +3246,27 @@ app.get("/admin/orders/:id", requireAdmin, adminAsync(async (req, res) => {
     storyIntakes[0] ||
     null
 
+  const signedReviewFiles = await withSignedReviewFiles(reviewFilesResult.data || [])
+  const signedDeliverables = await withSignedDeliverables(deliverablesResult.data || [])
+
   return res.json({
     success: true,
     order: {
       ...orderResult.data,
-      story_intake: activeStoryIntake,
-      story_intakes: storyIntakes,
-      voice_notes: voiceNotesResult.data || [],
+      story_intake: await withSignedStoryIntake(activeStoryIntake),
+      story_intakes: await Promise.all(storyIntakes.map((intake) => withSignedStoryIntake(intake))),
+      voice_notes: await withSignedVoiceNotes(voiceNotesResult.data || []),
+      cover_reference_images: await withSignedCoverReferenceImages(coverReferencesResult.data || []),
       call_bookings: callBookingsResult.data || [],
-      deliverables: deliverablesResult.data || [],
+      deliverables: signedDeliverables,
       revisions: revisionsResult.data || [],
       addons: addonsResult.data || [],
-      review_files: reviewFilesResult.data || [],
+      review_files: signedReviewFiles,
+      polaroid_photos: await withSignedPolaroids(polaroidsResult.data || []),
+      latest_review_file:
+        signedReviewFiles.find((item) => item.id === orderResult.data.latest_review_file_id) ||
+        signedReviewFiles[0] ||
+        null,
       ultra_priority: (addonsResult.data || []).some(addonLooksUltraPriority),
     },
   })
@@ -2756,6 +3335,129 @@ app.post("/admin/orders/:id/send-story-reminder", requireAdmin, adminAsync(async
   })
 }))
 
+app.post("/admin/orders/:id/upload-review-files", requireAdmin, adminUploadReviewFiles, adminAsync(async (req, res) => {
+  const id = adminRequireUuid(req.params.id, "order id")
+
+  const manuscriptFile = uploadedFile(req, ["manuscript_pdf", "manuscriptPdf", "pdf"])
+  const coverFile = uploadedFile(req, ["cover_file", "coverFile", "cover"])
+  const managerNote = normalizeText(req.body?.manager_note ?? req.body?.managerNote ?? "", 4000) || null
+
+  if (!manuscriptFile && !coverFile) {
+    return adminJsonError(res, 400, "Upload manuscript PDF or cover file.")
+  }
+
+  if (manuscriptFile && manuscriptFile.mimetype !== "application/pdf") {
+    return adminJsonError(res, 400, "Manuscript file must be a PDF.")
+  }
+
+  const allowedCoverTypes = new Set([
+    "application/pdf",
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+  ])
+
+  if (coverFile && !allowedCoverTypes.has(coverFile.mimetype)) {
+    return adminJsonError(res, 400, "Cover file must be PDF, JPG, PNG, or WEBP.")
+  }
+
+  const { data: order, error: orderErr } = await supabase
+    .from("orders")
+    .select("id, razorpay_order_id, name, email, edition")
+    .eq("id", id)
+    .single()
+
+  if (orderErr || !order) {
+    if (orderErr?.code === "PGRST116") return adminJsonError(res, 404, "Order not found.")
+    return adminHandleSupabaseError(res, orderErr, "Unable to load order.")
+  }
+
+  const now = new Date().toISOString()
+  const versionNumber = await getNextReviewVersion(id)
+
+  const manuscriptPath = manuscriptFile
+    ? await uploadReviewStorageFile(id, versionNumber, manuscriptFile, "manuscript")
+    : null
+
+  const coverPath = coverFile
+    ? await uploadReviewStorageFile(id, versionNumber, coverFile, "cover")
+    : null
+
+  const { data: reviewFile, error: reviewFileErr } = await supabase
+    .from("review_files")
+    .insert({
+      order_id: id,
+      version_number: versionNumber,
+      manuscript_pdf_path: manuscriptPath,
+      cover_file_path: coverPath,
+      manager_note: managerNote,
+      status: "sent_for_review",
+      sent_for_review_at: now,
+    })
+    .select("*")
+    .single()
+
+  if (reviewFileErr || !reviewFile) {
+    return adminHandleSupabaseError(res, reviewFileErr, "Unable to create review file.")
+  }
+
+  const { data: deliverable, error: deliverableErr } = await supabase
+    .from("deliverables")
+    .insert({
+      order_id: id,
+      pdf_path: manuscriptPath,
+      cover_path: coverPath,
+      uploaded_at: now,
+      review_file_id: reviewFile.id,
+      status: "waiting_customer_review",
+    })
+    .select("*")
+    .single()
+
+  if (deliverableErr || !deliverable) {
+    return adminHandleSupabaseError(res, deliverableErr, "Unable to create deliverable.")
+  }
+
+  await supabase
+    .from("orders")
+    .update({
+      production_status: "review_ready",
+      order_status: "review_ready",
+      latest_review_file_id: reviewFile.id,
+    })
+    .eq("id", id)
+
+  const signedReviewFile = (await withSignedReviewFiles([reviewFile]))[0]
+  const signedDeliverable = (await withSignedDeliverables([deliverable]))[0]
+  const portalUrl = `${PORTAL_BASE_URL}/story?order=${encodeURIComponent(order.razorpay_order_id)}`
+
+  if (order.email) {
+    await sendEmailSafe({
+      to: order.email,
+      subject: "Your review files are ready",
+      html: brandedEmailTemplate({
+        title: "Your review files are ready",
+        bodyHtml:
+          emailParagraph(`Dear ${escapeHtml(order.name || "SoulScript customer")},`) +
+          emailParagraph("Your manuscript and cover review files are now available in your story portal.") +
+          emailParagraph("Please review them carefully. You can approve them for printing or request changes from the portal."),
+        ctaLabel: "Open Review Portal",
+        ctaUrl: portalUrl,
+      }),
+    })
+  }
+
+  return res.json({
+    success: true,
+    review_file: signedReviewFile,
+    deliverable: signedDeliverable,
+    signedUrls: {
+      manuscript_pdf_url: signedReviewFile?.manuscript_pdf_signed_url || null,
+      cover_file_url: signedReviewFile?.cover_file_signed_url || null,
+    },
+  })
+}))
+
 app.patch("/admin/orders/:id", requireAdmin, adminAsync(async (req, res) => {
   const id = adminRequireUuid(req.params.id, "order id")
   const updates = {}
@@ -2797,7 +3499,7 @@ app.get("/admin/story-intakes", requireAdmin, adminAsync(async (req, res) => {
 app.get("/admin/voice-notes", requireAdmin, adminAsync(async (req, res) => {
   const { data, error } = await supabase.from("voice_notes").select("*").order("created_at", { ascending: false })
   if (error) return adminHandleSupabaseError(res, error, "Unable to load voice notes.")
-  return res.json({ success: true, voice_notes: data || [] })
+  return res.json({ success: true, voice_notes: await withSignedVoiceNotes(data || []) })
 }))
 
 app.get("/admin/call-bookings", requireAdmin, adminAsync(async (req, res) => {
@@ -2809,7 +3511,7 @@ app.get("/admin/call-bookings", requireAdmin, adminAsync(async (req, res) => {
 app.get("/admin/deliverables", requireAdmin, adminAsync(async (req, res) => {
   const { data, error } = await supabase.from("deliverables").select("*").order("uploaded_at", { ascending: false })
   if (error) return adminHandleSupabaseError(res, error, "Unable to load deliverables.")
-  return res.json({ success: true, deliverables: data || [] })
+  return res.json({ success: true, deliverables: await withSignedDeliverables(data || []) })
 }))
 
 app.get("/admin/revisions", requireAdmin, adminAsync(async (req, res) => {
@@ -2876,6 +3578,7 @@ app.patch("/admin/revisions/:id", requireAdmin, adminAsync(async (req, res) => {
   return res.json({ success: true, revision: data })
 }))
 
+/* Legacy path-based fallback. Chandan UI should use /admin/orders/:id/upload-review-files. */
 app.post("/admin/deliverables", requireAdmin, adminAsync(async (req, res) => {
   const orderId = adminRequireUuid(req.body.order_id, "order_id")
   const pdfPath = adminStringOrNull(req.body.pdf_path, "pdf_path", 1200)
@@ -2884,11 +3587,13 @@ app.post("/admin/deliverables", requireAdmin, adminAsync(async (req, res) => {
   if (!pdfPath && !coverPath) return adminJsonError(res, 400, "PDF path or cover path is required.")
 
   const now = new Date().toISOString()
+  const versionNumber = await getNextReviewVersion(orderId)
 
   const { data: reviewFile, error: reviewFileErr } = await supabase
     .from("review_files")
     .insert({
       order_id: orderId,
+      version_number: versionNumber,
       manuscript_pdf_path: pdfPath,
       cover_file_path: coverPath,
       status: "sent_for_review",
@@ -2943,7 +3648,11 @@ app.post("/admin/deliverables", requireAdmin, adminAsync(async (req, res) => {
     })
   }
 
-  return res.json({ success: true, deliverable: data, review_file: reviewFile || null })
+  return res.json({
+    success: true,
+    deliverable: (await withSignedDeliverables([data]))[0],
+    review_file: reviewFile ? (await withSignedReviewFiles([reviewFile]))[0] : null,
+  })
 }))
 
 /* =========================
@@ -2959,4 +3668,6 @@ app.listen(PORT, () => {
   console.log(`✅ ACCOUNT LOGIN   = Email OTP`)
   console.log(`✅ ADMIN API       = Enabled`)
   console.log(`✅ STORY API       = Enabled`)
+  console.log(`✅ STORAGE API     = Signed URLs enabled`)
 })
+```
