@@ -1,4 +1,6 @@
+Yes. Here is the full `index.js` with **one shared polished SoulScript email UI** used for every event email: OTP, reminder, portal link, order confirmation, story submitted, revisions, add-ons, print, review files, and admin notifications.
 
+```js
 // index.js (SoulScript Legacy backend)
 // Checkout upgraded:
 // - Backend calculates prices safely
@@ -9,6 +11,7 @@
 // - Admin API added for SoulScript admin panel
 // - Story Portal API added for story intake, voice note add-ons, cover add-ons, balance payments, revisions, extra copies, polaroids
 // - Admin API aligned for Chandan operations panel with real Supabase field names
+// - All customer/admin emails use one polished SoulScript branded email UI
 
 const express = require("express")
 const Razorpay = require("razorpay")
@@ -74,6 +77,10 @@ function escapeHtml(value) {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#039;")
+}
+
+function nl2br(value) {
+  return escapeHtml(value).replace(/\n/g, "<br />")
 }
 
 function hashOtp(email, otp) {
@@ -181,6 +188,134 @@ function addonIsPaid(addon) {
 function addonAmount(addon) {
   const amount = Number(addon?.amount || 0)
   return Number.isFinite(amount) ? amount : 0
+}
+
+function emailParagraph(html) {
+  return `
+    <div style="font-size:16px;line-height:1.7;color:#111111;margin:0 0 18px;">
+      ${html}
+    </div>
+  `
+}
+
+function emailMuted(html) {
+  return `
+    <div style="font-size:13px;line-height:1.7;color:#666666;margin:0 0 28px;">
+      ${html}
+    </div>
+  `
+}
+
+function emailDivider() {
+  return `<div style="height:1px;background:#eeeeee;margin:34px 0;"></div>`
+}
+
+function emailDetails(rows = []) {
+  const cleanRows = rows.filter((row) => row && row.label)
+  if (!cleanRows.length) return ""
+
+  return `
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="margin:26px 0 34px;border-collapse:collapse;">
+      ${cleanRows
+        .map(
+          (row) => `
+            <tr>
+              <td style="padding:10px 0;border-bottom:1px solid #eeeeee;width:42%;font-size:12px;line-height:1.5;color:#777777;text-transform:uppercase;letter-spacing:0.8px;vertical-align:top;">
+                ${escapeHtml(row.label)}
+              </td>
+              <td style="padding:10px 0;border-bottom:1px solid #eeeeee;font-size:14px;line-height:1.55;color:#111111;vertical-align:top;">
+                ${row.html ? row.value : escapeHtml(row.value)}
+              </td>
+            </tr>
+          `
+        )
+        .join("")}
+    </table>
+  `
+}
+
+function brandedEmailTemplate({
+  title,
+  bodyHtml,
+  ctaLabel,
+  ctaUrl,
+  footerHtml = "",
+}) {
+  const safeTitle = escapeHtml(title || "SoulScript Legacy")
+  const safeCtaUrl = ctaUrl ? escapeHtml(ctaUrl) : ""
+
+  const ctaHtml =
+    ctaLabel && ctaUrl
+      ? `
+        <div style="margin:34px 0 38px;">
+          <a href="${safeCtaUrl}" target="_blank" style="display:inline-block;background:#0E0E0E;color:#ffffff;padding:13px 18px;text-decoration:none;font-size:13px;letter-spacing:0.4px;">
+            ${escapeHtml(ctaLabel)}
+          </a>
+        </div>
+        <div style="font-size:13px;line-height:1.7;color:#666666;margin:0 0 42px;">
+          If the button does not open, copy this link into your browser:<br />
+          <a href="${safeCtaUrl}" target="_blank" style="color:#666666;text-decoration:underline;word-break:break-all;">
+            ${safeCtaUrl}
+          </a>
+        </div>
+      `
+      : ""
+
+  return `
+    <!doctype html>
+    <html>
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      </head>
+      <body style="margin:0;padding:0;background:#f3f3f3;font-family:Arial, Helvetica, sans-serif;color:#111111;">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#f3f3f3;margin:0;padding:0;">
+          <tr>
+            <td align="center" style="padding:42px 16px;">
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width:600px;background:#ffffff;margin:0 auto;color:#111111;">
+                <tr>
+                  <td align="center" style="padding:46px 38px 52px;background:#ffffff;color:#111111;">
+                    <div style="font-family:Georgia, 'Times New Roman', serif;font-size:20px;font-weight:500;letter-spacing:5px;color:#0E0E0E;line-height:1;text-transform:uppercase;">
+                      SOULSCRIPT
+                    </div>
+                    <div style="font-family:Arial, Helvetica, sans-serif;font-size:8.5px;font-weight:300;letter-spacing:5.5px;color:rgba(14,14,14,0.65);line-height:1;text-transform:uppercase;margin-top:7px;">
+                      LEGACY
+                    </div>
+
+                    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+                      <tr>
+                        <td style="padding-top:72px;text-align:left;background:#ffffff;color:#111111;">
+                          <div style="font-size:18px;line-height:1.4;font-weight:700;color:#111111;margin:0 0 46px;">
+                            ${safeTitle}
+                          </div>
+
+                          ${bodyHtml || ""}
+                          ${ctaHtml}
+
+                          <div style="font-size:16px;line-height:1.35;color:#111111;margin:0 0 82px;">
+                            Best regards,<br />
+                            SoulScript Legacy
+                          </div>
+
+                          ${footerHtml || ""}
+
+                          <div style="font-size:13px;line-height:1.6;color:#8a8a8a;margin:0;">
+                            <a href="${escapeHtml(PORTAL_BASE_URL)}/privacy" target="_blank" style="color:#8a8a8a;text-decoration:underline;">PRIVACY POLICY</a>
+                            <span style="color:#8a8a8a;"> · </span>
+                            <a href="${escapeHtml(PORTAL_BASE_URL)}/terms" target="_blank" style="color:#8a8a8a;text-decoration:underline;">Terms and Conditions</a>
+                          </div>
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      </body>
+    </html>
+  `
 }
 
 async function sendEmailSafe({ to, subject, html }) {
@@ -680,8 +815,16 @@ app.get("/debug/email", async (req, res) => {
     const r = await resend.emails.send({
       from: EMAIL_FROM,
       to: [to],
-      subject: "✅ Resend test (SoulScript)",
-      html: `<p>If you got this, Resend API works.</p><p>Time: ${new Date().toISOString()}</p>`,
+      subject: "Resend test (SoulScript)",
+      html: brandedEmailTemplate({
+        title: "Resend test",
+        bodyHtml:
+          emailParagraph("If you received this email, Resend is working correctly for SoulScript Legacy.") +
+          emailDetails([
+            { label: "Time", value: new Date().toISOString() },
+            { label: "Recipient", value: to },
+          ]),
+      }),
     })
 
     return res.json({ success: true, to, resend: r })
@@ -873,40 +1016,40 @@ app.post("/confirm-payment", async (req, res) => {
 
     await sendEmailSafe({
       to: ADMIN_EMAIL,
-      subject: `🖤 New Order Confirmed – ${edition}`,
-      html: `
-        <h2>New Order Confirmed</h2>
-        <p><strong>Edition:</strong> ${escapeHtml(edition)}</p>
-        <p><strong>Payment Type:</strong> ${
-          normalizedPaymentType === "PREPAID" ? "Paid in full" : "50% Advance"
-        }</p>
-        <p><strong>Amount Paid:</strong> ₹${amountToPay}</p>
-        <p><strong>Total Order Value:</strong> ₹${totalOrderValue}</p>
-        <p><strong>Pending Amount:</strong> ₹${pendingAmount}</p>
-        <p><strong>Ultra Priority:</strong> ${ultraPriority ? "Yes" : "No"}</p>
-        <p><strong>Razorpay Payment ID:</strong> ${escapeHtml(razorpay_payment_id)}</p>
-        <p><strong>Razorpay Order ID:</strong> ${escapeHtml(razorpay_order_id)}</p>
-        <hr />
-        <p><strong>Name:</strong> ${escapeHtml(customer.name)}</p>
-        <p><strong>Phone:</strong> ${escapeHtml(customer.phone)}</p>
-        <p><strong>Email:</strong> ${escapeHtml(normalizedEmail)}</p>
-        <p><strong>Address:</strong><br/>${escapeHtml(customer.address)}</p>
-      `,
+      subject: `New order confirmed - ${edition}`,
+      html: brandedEmailTemplate({
+        title: "New order confirmed",
+        bodyHtml:
+          emailParagraph(`A new SoulScript Legacy order has been confirmed.`) +
+          emailDetails([
+            { label: "Edition", value: edition },
+            { label: "Payment type", value: normalizedPaymentType === "PREPAID" ? "Paid in full" : "50% Advance" },
+            { label: "Amount paid", value: `₹${amountToPay}` },
+            { label: "Total order value", value: `₹${totalOrderValue}` },
+            { label: "Pending amount", value: `₹${pendingAmount}` },
+            { label: "Ultra priority", value: ultraPriority ? "Yes" : "No" },
+            { label: "Razorpay payment ID", value: razorpay_payment_id },
+            { label: "Razorpay order ID", value: razorpay_order_id },
+            { label: "Customer", value: customer.name },
+            { label: "Phone", value: customer.phone },
+            { label: "Email", value: normalizedEmail },
+            { label: "Address", value: nl2br(customer.address), html: true },
+          ]),
+      }),
     })
 
     await sendEmailSafe({
       to: normalizedEmail,
       subject: `Your SoulScript Legacy order is confirmed`,
-      html: `
-        <div style="font-family: Arial, sans-serif; line-height:1.7; color:#111;">
-          <h2>Order confirmed</h2>
-          <p>Dear ${escapeHtml(customer.name)},</p>
-          <p>Your ${escapeHtml(edition)} has been booked successfully.</p>
-          <p>You can now open your private story submission portal and submit your details.</p>
-          <p><a href="${PORTAL_BASE_URL}/story?order=${encodeURIComponent(razorpay_order_id)}" style="display:inline-block;background:#0E0E0E;color:#fff;padding:12px 16px;text-decoration:none;">Open Story Portal</a></p>
-          <p>Best regards,<br/>SoulScript Legacy</p>
-        </div>
-      `,
+      html: brandedEmailTemplate({
+        title: "Order confirmed",
+        bodyHtml:
+          emailParagraph(`Dear ${escapeHtml(customer.name)},`) +
+          emailParagraph(`Your ${escapeHtml(edition)} has been booked successfully.`) +
+          emailParagraph("You can now open your private story submission portal and submit your details."),
+        ctaLabel: "Open Story Portal",
+        ctaUrl: `${PORTAL_BASE_URL}/story?order=${encodeURIComponent(razorpay_order_id)}`,
+      }),
     })
 
     return res.json({
@@ -955,8 +1098,6 @@ async function sendAccountOtpForEmail(email, res) {
   const customerName =
     String(existingOrders?.[0]?.name || "").trim() || "SoulScript customer"
 
-  const safeCustomerName = escapeHtml(customerName)
-
   const otp = createOtp()
   const otpHash = hashOtp(cleanEmail, otp)
   const expiresAt = new Date(
@@ -983,37 +1124,18 @@ async function sendAccountOtpForEmail(email, res) {
     return res.status(500).json({ error: "Could not create OTP" })
   }
 
-  const html = `
-    <!doctype html>
-    <html>
-      <head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" /></head>
-      <body style="margin:0;padding:0;background:#f3f3f3;font-family:Arial, Helvetica, sans-serif;color:#111111;">
-        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#f3f3f3;margin:0;padding:0;">
-          <tr><td align="center" style="padding:42px 16px;">
-            <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width:600px;background:#ffffff;margin:0 auto;color:#111111;">
-              <tr><td align="center" style="padding:46px 38px 52px;background:#ffffff;color:#111111;">
-                <div style="font-family:Georgia, 'Times New Roman', serif;font-size:20px;font-weight:500;letter-spacing:5px;color:#0E0E0E;line-height:1;text-transform:uppercase;">SOULSCRIPT</div>
-                <div style="font-family:Arial, Helvetica, sans-serif;font-size:8.5px;font-weight:300;letter-spacing:5.5px;color:rgba(14,14,14,0.65);line-height:1;text-transform:uppercase;margin-top:7px;">LEGACY</div>
-                <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0"><tr><td style="padding-top:72px;text-align:left;background:#ffffff;color:#111111;">
-                  <div style="font-size:18px;line-height:1.4;font-weight:700;color:#111111;margin:0 0 46px;">Profile code</div>
-                  <div style="font-size:16px;line-height:1.7;color:#111111;margin:0 0 26px;">Dear ${safeCustomerName},</div>
-                  <div style="font-size:16px;line-height:1.7;color:#111111;margin:0 0 12px;">Below you can find the verification code:</div>
-                  <div style="font-size:26px;line-height:1.2;letter-spacing:2px;font-weight:400;color:#000000;margin:0 0 18px;">${otp}</div>
-                  <div style="font-size:16px;line-height:1.7;color:#111111;margin:0 0 66px;">This code will expire in ${OTP_EXPIRY_MINUTES} minutes.</div>
-                  <div style="font-size:16px;line-height:1.35;color:#111111;margin:0 0 82px;">Best regards,<br />SoulScript Legacy</div>
-                  <div style="font-size:13px;line-height:1.6;color:#8a8a8a;margin:0;">
-                    <a href="${PORTAL_BASE_URL}/privacy" target="_blank" style="color:#8a8a8a;text-decoration:underline;">PRIVACY POLICY</a>
-                    <span style="color:#8a8a8a;"> · </span>
-                    <a href="${PORTAL_BASE_URL}/terms" target="_blank" style="color:#8a8a8a;text-decoration:underline;">Terms and Conditions</a>
-                  </div>
-                </td></tr></table>
-              </td></tr>
-            </table>
-          </td></tr>
-        </table>
-      </body>
-    </html>
-  `
+  const html = brandedEmailTemplate({
+    title: "Profile code",
+    bodyHtml:
+      emailParagraph(`Dear ${escapeHtml(customerName)},`) +
+      emailParagraph("Below you can find the verification code:") +
+      `
+        <div style="font-size:26px;line-height:1.2;letter-spacing:2px;font-weight:400;color:#000000;margin:0 0 18px;">
+          ${otp}
+        </div>
+      ` +
+      emailParagraph(`This code will expire in ${OTP_EXPIRY_MINUTES} minutes.`),
+  })
 
   try {
     const r = await resend.emails.send({
@@ -1343,15 +1465,14 @@ app.post("/send-portal-link", async (req, res) => {
 
     const portalUrl = `${PORTAL_BASE_URL}/story?token=${token}`
 
-    const html = `
-      <div style="font-family: Inter, Arial, sans-serif; line-height:1.6;">
-        <p>Hi,</p>
-        <p>Here is your secure link to continue your story:</p>
-        <p><a href="${portalUrl}" style="display:inline-block;padding:12px 16px;background:#000;color:#fff;text-decoration:none;border-radius:10px;">Open My Story Portal</a></p>
-        <p style="color:#555;font-size:13px;">This link expires in 30 minutes.</p>
-        <p>— SoulScript Legacy</p>
-      </div>
-    `
+    const html = brandedEmailTemplate({
+      title: "Your writing link",
+      bodyHtml:
+        emailParagraph("Here is your secure link to continue your SoulScript Legacy story.") +
+        emailMuted("This link expires in 30 minutes."),
+      ctaLabel: "Open Story Portal",
+      ctaUrl: portalUrl,
+    })
 
     const sent = await sendEmailSafe({ to: normalizedEmail, subject: "Your SoulScript Legacy writing link", html })
 
@@ -1359,8 +1480,18 @@ app.post("/send-portal-link", async (req, res) => {
 
     const fallback = await sendEmailSafe({
       to: ADMIN_EMAIL,
-      subject: "⚠️ Portal link fallback (customer blocked)",
-      html: `<p><b>Customer email blocked:</b> ${escapeHtml(normalizedEmail)}</p><hr/>${html}`,
+      subject: "Portal link fallback - customer blocked",
+      html: brandedEmailTemplate({
+        title: "Portal link fallback",
+        bodyHtml:
+          emailParagraph(`Resend could not send directly to this customer.`) +
+          emailDetails([
+            { label: "Customer email", value: normalizedEmail },
+            { label: "Portal URL", value: portalUrl },
+          ]),
+        ctaLabel: "Open Story Portal",
+        ctaUrl: portalUrl,
+      }),
     })
 
     if (fallback.ok) {
@@ -1639,15 +1770,19 @@ app.post("/story/confirm-addon-payment", async (req, res) => {
 
     await sendEmailSafe({
       to: ADMIN_EMAIL,
-      subject: `💳 Add-on paid – ${addon.addon_type}`,
-      html: `
-        <h2>Add-on payment received</h2>
-        <p><strong>Order:</strong> ${escapeHtml(order?.razorpay_order_id || addon.order_id)}</p>
-        <p><strong>Customer:</strong> ${escapeHtml(order?.name || "")}</p>
-        <p><strong>Email:</strong> ${escapeHtml(order?.email || "")}</p>
-        <p><strong>Add-on:</strong> ${escapeHtml(addon.addon_type)}</p>
-        <p><strong>Amount:</strong> ₹${addon.amount}</p>
-      `,
+      subject: `Add-on paid - ${addon.addon_type}`,
+      html: brandedEmailTemplate({
+        title: "Add-on payment received",
+        bodyHtml:
+          emailParagraph("A customer has completed an add-on payment.") +
+          emailDetails([
+            { label: "Order", value: order?.razorpay_order_id || addon.order_id },
+            { label: "Customer", value: order?.name || "" },
+            { label: "Email", value: order?.email || "" },
+            { label: "Add-on", value: addon.addon_type },
+            { label: "Amount", value: `₹${addon.amount}` },
+          ]),
+      }),
     })
 
     return res.json({ success: true, addon })
@@ -1968,38 +2103,39 @@ app.post("/story/submit-intake", async (req, res) => {
 
     await sendEmailSafe({
       to: ADMIN_EMAIL,
-      subject: `📖 Story Submitted – ${order.edition}`,
-      html: `
-        <h2>New Story Submitted</h2>
-        <p><strong>Edition:</strong> ${escapeHtml(order.edition)}</p>
-        <p><strong>Order:</strong> ${escapeHtml(order.razorpay_order_id)}</p>
-        <p><strong>Name:</strong> ${escapeHtml(order.name)}</p>
-        <p><strong>Email:</strong> ${escapeHtml(order.email)}</p>
-        <p><strong>Phone:</strong> ${escapeHtml(order.phone)}</p>
-        <hr />
-        <p><strong>Cover Type:</strong> ${escapeHtml(coverType || "")}</p>
-        <p><strong>Title:</strong> ${escapeHtml(coverTitle || "")}</p>
-        <p><strong>Author:</strong> ${escapeHtml(authorName || "")}</p>
-        <p><strong>Note to writer:</strong><br/>${escapeHtml(cleanNoteToWriter)}</p>
-        <hr />
-        <h3>Story</h3>
-        <pre style="white-space: pre-wrap; font-family: serif;">${escapeHtml(cleanStory)}</pre>
-      `,
+      subject: `Story submitted - ${order.edition}`,
+      html: brandedEmailTemplate({
+        title: "Story submitted",
+        bodyHtml:
+          emailParagraph("A customer has submitted their story intake.") +
+          emailDetails([
+            { label: "Edition", value: order.edition },
+            { label: "Order", value: order.razorpay_order_id },
+            { label: "Name", value: order.name },
+            { label: "Email", value: order.email },
+            { label: "Phone", value: order.phone },
+            { label: "Cover type", value: coverType || "" },
+            { label: "Title", value: coverTitle || "" },
+            { label: "Author", value: authorName || "" },
+            { label: "Note to writer", value: nl2br(cleanNoteToWriter), html: true },
+          ]) +
+          emailDivider() +
+          emailParagraph(`<strong>Story</strong>`) +
+          emailMuted(nl2br(cleanStory)),
+      }),
     })
 
     await sendEmailSafe({
       to: order.email,
       subject: "Your story has been submitted",
-      html: `
-        <div style="font-family: Arial, sans-serif; line-height:1.7;color:#111;">
-          <h2>Your story is with us</h2>
-          <p>Dear ${escapeHtml(order.name)},</p>
-          <p>Your story submission has been received successfully.</p>
-          <p>Your review files will be shared within <strong>${timeline}</strong>.</p>
-          <p>Because this is a custom novel written specifically around your life and details, the writing and review process takes careful time.</p>
-          <p>Best regards,<br/>SoulScript Legacy</p>
-        </div>
-      `,
+      html: brandedEmailTemplate({
+        title: "Your story is with us",
+        bodyHtml:
+          emailParagraph(`Dear ${escapeHtml(order.name)},`) +
+          emailParagraph("Your story submission has been received successfully.") +
+          emailParagraph(`Your review files will be shared within <strong>${escapeHtml(timeline)}</strong>.`) +
+          emailParagraph("Because this is a custom novel written specifically around your life and details, the writing and review process takes careful time."),
+      }),
     })
 
     return res.json({ success: true, story_submitted: true, intake, timeline })
@@ -2053,17 +2189,21 @@ app.post("/submit-story", async (req, res) => {
 
     await sendEmailSafe({
       to: ADMIN_EMAIL,
-      subject: `📖 Story Submitted – ${order.edition}`,
-      html: `
-        <h2>New Story Submitted</h2>
-        <p><strong>Edition:</strong> ${escapeHtml(order.edition)}</p>
-        <p><strong>Name:</strong> ${escapeHtml(order.name)}</p>
-        <p><strong>Email:</strong> ${escapeHtml(order.email)}</p>
-        <p><strong>Phone:</strong> ${escapeHtml(order.phone)}</p>
-        <hr />
-        <h3>Story</h3>
-        <pre style="white-space: pre-wrap; font-family: serif;">${escapeHtml(cleanStory)}</pre>
-      `,
+      subject: `Story submitted - ${order.edition}`,
+      html: brandedEmailTemplate({
+        title: "Story submitted",
+        bodyHtml:
+          emailParagraph("A story was submitted through the legacy endpoint.") +
+          emailDetails([
+            { label: "Edition", value: order.edition },
+            { label: "Name", value: order.name },
+            { label: "Email", value: order.email },
+            { label: "Phone", value: order.phone },
+          ]) +
+          emailDivider() +
+          emailParagraph(`<strong>Story</strong>`) +
+          emailMuted(nl2br(cleanStory)),
+      }),
     })
 
     return res.json({ success: true, story_submitted: true })
@@ -2104,29 +2244,32 @@ app.post("/story/request-revision", async (req, res) => {
 
     await sendEmailSafe({
       to: ADMIN_EMAIL,
-      subject: `📝 Revision requested – ${order.edition}`,
-      html: `
-        <h2>Revision requested</h2>
-        <p><strong>Order:</strong> ${escapeHtml(order.razorpay_order_id)}</p>
-        <p><strong>Customer:</strong> ${escapeHtml(order.name)}</p>
-        <p><strong>Type:</strong> ${escapeHtml(revisionType)}</p>
-        <p><strong>Description:</strong><br/>${escapeHtml(cleanDescription)}</p>
-      `,
+      subject: `Revision requested - ${order.edition}`,
+      html: brandedEmailTemplate({
+        title: "Revision requested",
+        bodyHtml:
+          emailParagraph("A customer has requested changes.") +
+          emailDetails([
+            { label: "Order", value: order.razorpay_order_id },
+            { label: "Customer", value: order.name },
+            { label: "Type", value: revisionType },
+            { label: "Description", value: nl2br(cleanDescription), html: true },
+          ]),
+      }),
     })
 
     await sendEmailSafe({
       to: order.email,
       subject: "We received your change request",
-      html: `
-        <div style="font-family: Arial, sans-serif; line-height:1.7;color:#111;">
-          <h2>Change request received</h2>
-          <p>Dear ${escapeHtml(order.name)},</p>
-          <p>We have received your requested changes for your novel.</p>
-          <p>If the correction falls within the original brief or is a mistake from our side, it will be corrected without additional charge. If it introduces new requirements outside the original brief, our team will share the applicable charges before proceeding.</p>
-          <p>You will receive an update within approximately 2 working days.</p>
-          <p>Best regards,<br/>SoulScript Legacy</p>
-        </div>
-      `,
+      html: brandedEmailTemplate({
+        title: "Change request received",
+        bodyHtml:
+          emailParagraph(`Dear ${escapeHtml(order.name)},`) +
+          emailParagraph("We have received your requested changes for your novel.") +
+          emailParagraph("If the correction falls within the original brief or is a mistake from our side, it will be corrected without additional charge.") +
+          emailParagraph("If it introduces new requirements outside the original brief, our team will share the applicable charges before proceeding.") +
+          emailParagraph("You will receive an update within approximately 2 working days."),
+      }),
     })
 
     return res.json({ success: true, revision: data })
@@ -2174,22 +2317,29 @@ app.post("/story/proceed-print", async (req, res) => {
     await sendEmailSafe({
       to: order.email,
       subject: "Your book has been sent for printing",
-      html: `
-        <div style="font-family: Arial, sans-serif; line-height:1.7;color:#111;">
-          <h2>Sent for printing</h2>
-          <p>Dear ${escapeHtml(order.name)},</p>
-          <p>Your manuscript and cover have been approved and your book has now been sent for printing.</p>
-          <p>Since this is a customized novel written specifically around your life, the final production and quality checks take careful time.</p>
-          <p>You can expect delivery within <strong>16 to 21 working days</strong>.</p>
-          <p>Best regards,<br/>SoulScript Legacy</p>
-        </div>
-      `,
+      html: brandedEmailTemplate({
+        title: "Sent for printing",
+        bodyHtml:
+          emailParagraph(`Dear ${escapeHtml(order.name)},`) +
+          emailParagraph("Your manuscript and cover have been approved and your book has now been sent for printing.") +
+          emailParagraph("Since this is a customized novel written specifically around your life, the final production and quality checks take careful time.") +
+          emailParagraph("You can expect delivery within <strong>16 to 21 working days</strong>."),
+      }),
     })
 
     await sendEmailSafe({
       to: ADMIN_EMAIL,
-      subject: `🖨️ Print requested – ${order.edition}`,
-      html: `<p>Order ${escapeHtml(order.razorpay_order_id)} has been approved for printing.</p>`,
+      subject: `Print requested - ${order.edition}`,
+      html: brandedEmailTemplate({
+        title: "Print requested",
+        bodyHtml:
+          emailParagraph("A customer has approved review files for printing.") +
+          emailDetails([
+            { label: "Order", value: order.razorpay_order_id },
+            { label: "Customer", value: order.name },
+            { label: "Edition", value: order.edition },
+          ]),
+      }),
     })
 
     return res.json({ success: true, deliverables: data || [] })
@@ -2213,7 +2363,7 @@ const ADMIN_ALLOWED_ORIGINS = new Set([
 
 const ADMIN_TOKEN_TTL_SECONDS = 60 * 60 * 12
 const ADMIN_UUID_RE =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{12}$/i
 
 class AdminInputError extends Error {
   constructor(message) {
@@ -2578,86 +2728,18 @@ app.post("/admin/orders/:id/send-story-reminder", requireAdmin, adminAsync(async
   const customerName = String(order.name || "").trim() || "SoulScript customer"
   const editionName = String(order.edition || "SoulScript Legacy edition").trim()
 
-  const html = `
-    <!doctype html>
-    <html>
-      <head>
-        <meta charset="utf-8" />
-        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-      </head>
-      <body style="margin:0;padding:0;background:#f3f3f3;font-family:Arial, Helvetica, sans-serif;color:#111111;">
-        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#f3f3f3;margin:0;padding:0;">
-          <tr>
-            <td align="center" style="padding:42px 16px;">
-              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width:600px;background:#ffffff;margin:0 auto;color:#111111;">
-                <tr>
-                  <td align="center" style="padding:46px 38px 52px;background:#ffffff;color:#111111;">
-                    <div style="font-family:Georgia, 'Times New Roman', serif;font-size:20px;font-weight:500;letter-spacing:5px;color:#0E0E0E;line-height:1;text-transform:uppercase;">
-                      SOULSCRIPT
-                    </div>
-                    <div style="font-family:Arial, Helvetica, sans-serif;font-size:8.5px;font-weight:300;letter-spacing:5.5px;color:rgba(14,14,14,0.65);line-height:1;text-transform:uppercase;margin-top:7px;">
-                      LEGACY
-                    </div>
-
-                    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
-                      <tr>
-                        <td style="padding-top:72px;text-align:left;background:#ffffff;color:#111111;">
-                          <div style="font-size:18px;line-height:1.4;font-weight:700;color:#111111;margin:0 0 46px;">
-                            Your story portal is waiting
-                          </div>
-
-                          <div style="font-size:16px;line-height:1.7;color:#111111;margin:0 0 26px;">
-                            Dear ${escapeHtml(customerName)},
-                          </div>
-
-                          <div style="font-size:16px;line-height:1.7;color:#111111;margin:0 0 18px;">
-                            This is a gentle reminder to complete your SoulScript Legacy story submission.
-                          </div>
-
-                          <div style="font-size:16px;line-height:1.7;color:#111111;margin:0 0 34px;">
-                            Your ${escapeHtml(editionName)} can move into the writing process once your story details are shared with us.
-                          </div>
-
-                          <div style="margin:0 0 38px;">
-                            <a href="${portalUrl}" target="_blank" style="display:inline-block;background:#0E0E0E;color:#ffffff;padding:13px 18px;text-decoration:none;font-size:13px;letter-spacing:0.4px;">
-                              Open Story Portal
-                            </a>
-                          </div>
-
-                          <div style="font-size:13px;line-height:1.7;color:#666666;margin:0 0 52px;">
-                            If the button does not open, copy this link into your browser:<br />
-                            <a href="${portalUrl}" target="_blank" style="color:#666666;text-decoration:underline;word-break:break-all;">
-                              ${portalUrl}
-                            </a>
-                          </div>
-
-                          <div style="font-size:16px;line-height:1.35;color:#111111;margin:0 0 82px;">
-                            Best regards,<br />
-                            SoulScript Legacy
-                          </div>
-
-                          <div style="font-size:13px;line-height:1.6;color:#8a8a8a;margin:0;">
-                            <a href="${PORTAL_BASE_URL}/privacy" target="_blank" style="color:#8a8a8a;text-decoration:underline;">PRIVACY POLICY</a>
-                            <span style="color:#8a8a8a;"> · </span>
-                            <a href="${PORTAL_BASE_URL}/terms" target="_blank" style="color:#8a8a8a;text-decoration:underline;">Terms and Conditions</a>
-                          </div>
-                        </td>
-                      </tr>
-                    </table>
-                  </td>
-                </tr>
-              </table>
-            </td>
-          </tr>
-        </table>
-      </body>
-    </html>
-  `
-
   const sent = await sendEmailSafe({
     to: customerEmail,
     subject: "Complete your SoulScript Legacy story",
-    html,
+    html: brandedEmailTemplate({
+      title: "Your story portal is waiting",
+      bodyHtml:
+        emailParagraph(`Dear ${escapeHtml(customerName)},`) +
+        emailParagraph("This is a gentle reminder to complete your SoulScript Legacy story submission.") +
+        emailParagraph(`Your ${escapeHtml(editionName)} can move into the writing process once your story details are shared with us.`),
+      ctaLabel: "Open Story Portal",
+      ctaUrl: portalUrl,
+    }),
   })
 
   if (!sent.ok) {
@@ -2852,16 +2934,15 @@ app.post("/admin/deliverables", requireAdmin, adminAsync(async (req, res) => {
     await sendEmailSafe({
       to: order.email,
       subject: "Your review files are ready",
-      html: `
-        <div style="font-family: Arial, sans-serif; line-height:1.7;color:#111;">
-          <h2>Your review files are ready</h2>
-          <p>Dear ${escapeHtml(order.name)},</p>
-          <p>Your manuscript and cover review files are now available in your story portal.</p>
-          <p>Please review them carefully. You can approve them for printing or request changes from the portal.</p>
-          <p><a href="${PORTAL_BASE_URL}/story?order=${encodeURIComponent(order.razorpay_order_id)}" style="display:inline-block;background:#0E0E0E;color:#fff;padding:12px 16px;text-decoration:none;">Open Review Portal</a></p>
-          <p>Best regards,<br/>SoulScript Legacy</p>
-        </div>
-      `,
+      html: brandedEmailTemplate({
+        title: "Your review files are ready",
+        bodyHtml:
+          emailParagraph(`Dear ${escapeHtml(order.name)},`) +
+          emailParagraph("Your manuscript and cover review files are now available in your story portal.") +
+          emailParagraph("Please review them carefully. You can approve them for printing or request changes from the portal."),
+        ctaLabel: "Open Review Portal",
+        ctaUrl: `${PORTAL_BASE_URL}/story?order=${encodeURIComponent(order.razorpay_order_id)}`,
+      }),
     })
   }
 
