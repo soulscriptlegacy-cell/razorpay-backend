@@ -1,4 +1,4 @@
- 
+
 
 // index.js (SoulScript Legacy backend)
 // Checkout upgraded:
@@ -3663,4 +3663,3 @@ app.listen(PORT, () => {
   console.log(`✅ STORY API       = Enabled`)
   console.log(`✅ STORAGE API     = Signed URLs enabled`)
 })
-```
