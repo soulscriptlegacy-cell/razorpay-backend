@@ -1,4 +1,3 @@
-
 // index.js (SoulScript Legacy backend)
 // Checkout upgraded:
 // - Backend calculates prices safely
@@ -2961,4 +2960,3 @@ app.listen(PORT, () => {
   console.log(`✅ ADMIN API       = Enabled`)
   console.log(`✅ STORY API       = Enabled`)
 })
-```
