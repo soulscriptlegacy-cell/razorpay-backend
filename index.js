@@ -1,6 +1,4 @@
-Yes. Here is the full `index.js` with **one shared polished SoulScript email UI** used for every event email: OTP, reminder, portal link, order confirmation, story submitted, revisions, add-ons, print, review files, and admin notifications.
 
-```js
 // index.js (SoulScript Legacy backend)
 // Checkout upgraded:
 // - Backend calculates prices safely
