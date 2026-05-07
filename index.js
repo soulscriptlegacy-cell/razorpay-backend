@@ -1,12 +1,5 @@
-Yes. Use this full corrected `index.js`.
-
-Important: add `multer` on Render before deploying:
-
-```bash
 npm install multer
-```
 
-```js
 // index.js (SoulScript Legacy backend)
 // Checkout upgraded:
 // - Backend calculates prices safely
