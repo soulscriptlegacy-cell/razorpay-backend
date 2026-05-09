@@ -1,26 +1,17 @@
 // index.js (SoulScript Legacy backend)
-// Checkout upgraded:
-// - Backend calculates prices safely
-// - Breeze Edition kept at ₹2 for testing
-// - Razorpay signature verification fixed
-// - Account login upgraded from magic link to email OTP
-// - Existing routes preserved: dispatch hook, email debug, portal link, portal order, submit story
-// - Admin API added for SoulScript admin panel
-// - Story Portal API added for story intake, voice note add-ons, cover add-ons, balance payments, revisions, extra copies, polaroids
-// - Admin API aligned for Chandan operations panel with real Supabase field names
-// - All customer/admin emails use one polished SoulScript branded email UI
-// - Private Supabase Storage files are served through signed URLs
-// - Chandan manager route added with safe operational data only
-// - Review files can be uploaded directly from admin panel
-// - Print submission, shipment, payout, review chat, revenue summary admin routes added
-// - Legacy upload route alias added
-// - Admin CORS now allows *.vercel.app preview deployments
+// Phase 1 additions:
+// - GET /admin/orders/:id/download-story (story as .txt download)
+// - GET /admin/orders/:id/download-voice-notes (all voice notes as zip)
+// - GET /admin/orders/:id/download-cover-material (cover photo OR refs + notes as zip)
+// - POST /admin/orders/:id/upload-review-files now accepts optional title + author_name
+//   to fill in if customer didn't provide them in story intake
 
 const express = require("express")
 const Razorpay = require("razorpay")
 const crypto = require("crypto")
 const cors = require("cors")
 const multer = require("multer")
+const archiver = require("archiver")
 const { Resend } = require("resend")
 const { createClient } = require("@supabase/supabase-js")
 
@@ -451,6 +442,53 @@ async function getPublicOrSignedStorageUrl(bucket, path, expiresInSeconds = 3600
   if (!cleanPath) return null
   if (/^https?:\/\//i.test(cleanPath)) return cleanPath
   return createSignedUrl(bucket, cleanPath, expiresInSeconds)
+}
+
+// Download a storage file as Buffer (for zip bundling)
+async function downloadStorageFileBuffer(bucket, path) {
+  const cleanBucket = String(bucket || "").trim()
+  const cleanPath = cleanStoragePath(path)
+
+  if (!cleanBucket || !cleanPath) return null
+
+  try {
+    const { data, error } = await supabase.storage.from(cleanBucket).download(cleanPath)
+    if (error) {
+      console.error("⚠️ Download storage file failed:", {
+        bucket: cleanBucket,
+        path: cleanPath,
+        error,
+      })
+      return null
+    }
+    if (!data) return null
+    const arrayBuffer = await data.arrayBuffer()
+    return Buffer.from(arrayBuffer)
+  } catch (error) {
+    console.error("⚠️ Download storage file exception:", {
+      bucket: cleanBucket,
+      path: cleanPath,
+      error: safeErr(error),
+    })
+    return null
+  }
+}
+
+// Try multiple buckets to find a file (legacy paths may be in different buckets)
+async function downloadStorageFileWithFallback(buckets, path) {
+  const bucketList = Array.isArray(buckets) ? buckets : [buckets]
+  for (const bucket of bucketList) {
+    const buffer = await downloadStorageFileBuffer(bucket, path)
+    if (buffer) return { buffer, bucket }
+  }
+  return null
+}
+
+function basenameFromPath(path) {
+  const cleaned = cleanStoragePath(path)
+  if (!cleaned) return ""
+  const parts = cleaned.split("/")
+  return parts[parts.length - 1] || cleaned
 }
 
 async function withSignedVoiceNotes(voiceNotes = []) {
@@ -1118,6 +1156,11 @@ app.get("/health", (req, res) => {
     accountLogin: "email_otp",
     otpExpiryMinutes: OTP_EXPIRY_MINUTES,
     storageBuckets: STORAGE_BUCKETS,
+    phase1Endpoints: [
+      "GET /admin/orders/:id/download-story",
+      "GET /admin/orders/:id/download-voice-notes",
+      "GET /admin/orders/:id/download-cover-material",
+    ],
   })
 })
 
@@ -1313,7 +1356,7 @@ app.post("/confirm-payment", async (req, res) => {
           edition,
           payment_type: normalizedPaymentType,
           amount: amountToPay,
-          total_order_value: totalOrderValue || null,
+          total_order_value: totalOrderValue || amountToPay,
           paid_amount: amountToPay,
           balance_due: pendingAmount,
           pending_amount: pendingAmount,
@@ -2948,6 +2991,7 @@ const ADMIN_ORDER_LIST_FIELDS = [
   "writer_name",
   "manager_payout",
   "writer_payout",
+  "white_labeling",
 ].join(",")
 
 const ADMIN_ORDER_DETAIL_FIELDS = ADMIN_ORDER_LIST_FIELDS
@@ -2984,6 +3028,7 @@ const MANAGER_ORDER_FIELDS = [
   "awb_number",
   "shipping_label_path",
   "shipping_label_url",
+  "white_labeling",
 ].join(",")
 
 app.post("/admin/login", adminAsync(async (req, res) => {
@@ -3082,6 +3127,326 @@ app.get("/admin/storage/signed-url", requireAdmin, adminAsync(async (req, res) =
   if (!signedUrl) return adminJsonError(res, 404, "Could not create signed URL.")
 
   return res.json({ success: true, signedUrl })
+}))
+
+/* =========================
+   PHASE 1: DOWNLOAD STORY AS .TXT
+========================= */
+app.get("/admin/orders/:id/download-story", requireAdmin, adminAsync(async (req, res) => {
+  const id = adminRequireUuid(req.params.id, "order id")
+
+  const { data: order, error } = await supabase
+    .from("orders")
+    .select("id, razorpay_order_id, name, edition, story")
+    .eq("id", id)
+    .single()
+
+  if (error || !order) {
+    if (error?.code === "PGRST116") return adminJsonError(res, 404, "Order not found.")
+    return adminHandleSupabaseError(res, error, "Unable to load order.")
+  }
+
+  // Try story from orders table first; fall back to latest submitted story_intake
+  let storyText = String(order.story || "").trim()
+
+  if (!storyText) {
+    const { data: intakes } = await supabase
+      .from("story_intakes")
+      .select("text_story, submitted, submitted_at")
+      .eq("order_id", id)
+      .order("updated_at", { ascending: false })
+
+    const submittedIntake = (intakes || []).find((i) => i.submitted === true && i.submitted_at)
+    const fallbackIntake = submittedIntake || (intakes || [])[0]
+
+    if (fallbackIntake?.text_story) {
+      storyText = String(fallbackIntake.text_story).trim()
+    }
+  }
+
+  if (!storyText) {
+    return adminJsonError(res, 404, "No story text found for this order.")
+  }
+
+  const customerName = (order.name || "customer").replace(/[^a-zA-Z0-9 _-]/g, "_").trim() || "customer"
+  const orderRef = order.razorpay_order_id || id
+  const fileName = safeFileName(`story-${customerName}-${orderRef}.txt`)
+
+  // Add a header inside the file so writer knows context
+  const header = [
+    `SoulScript Legacy — Story Submission`,
+    `Customer: ${order.name || ""}`,
+    `Edition: ${order.edition || ""}`,
+    `Order Number: ${order.razorpay_order_id || ""}`,
+    `Downloaded: ${new Date().toISOString()}`,
+    "",
+    "----------------------------------------",
+    "",
+  ].join("\n")
+
+  const finalContent = header + storyText + "\n"
+
+  res.setHeader("Content-Type", "text/plain; charset=utf-8")
+  res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`)
+  res.setHeader("Cache-Control", "no-store")
+  return res.send(finalContent)
+}))
+
+/* =========================
+   PHASE 1: DOWNLOAD ALL VOICE NOTES AS ZIP
+========================= */
+app.get("/admin/orders/:id/download-voice-notes", requireAdmin, adminAsync(async (req, res) => {
+  const id = adminRequireUuid(req.params.id, "order id")
+
+  const { data: order, error: orderErr } = await supabase
+    .from("orders")
+    .select("id, razorpay_order_id, name, edition")
+    .eq("id", id)
+    .single()
+
+  if (orderErr || !order) {
+    if (orderErr?.code === "PGRST116") return adminJsonError(res, 404, "Order not found.")
+    return adminHandleSupabaseError(res, orderErr, "Unable to load order.")
+  }
+
+  const { data: voiceNotes, error: vnErr } = await supabase
+    .from("voice_notes")
+    .select("*")
+    .eq("order_id", id)
+    .order("created_at", { ascending: true })
+
+  if (vnErr) return adminHandleSupabaseError(res, vnErr, "Unable to load voice notes.")
+
+  if (!voiceNotes || voiceNotes.length === 0) {
+    return adminJsonError(res, 404, "No voice notes found for this order.")
+  }
+
+  const customerName = (order.name || "customer").replace(/[^a-zA-Z0-9 _-]/g, "_").trim() || "customer"
+  const orderRef = order.razorpay_order_id || id
+  const zipFileName = safeFileName(`voice-notes-${customerName}-${orderRef}.zip`)
+
+  res.setHeader("Content-Type", "application/zip")
+  res.setHeader("Content-Disposition", `attachment; filename="${zipFileName}"`)
+  res.setHeader("Cache-Control", "no-store")
+
+  const archive = archiver("zip", { zlib: { level: 6 } })
+
+  archive.on("error", (err) => {
+    console.error("❌ Voice notes archive error:", err)
+    if (!res.headersSent) {
+      res.status(500).json({ success: false, message: "Could not build zip" })
+    } else {
+      res.end()
+    }
+  })
+
+  archive.pipe(res)
+
+  // Build a manifest text file with metadata
+  const manifestLines = [
+    `SoulScript Legacy — Voice Notes`,
+    `Customer: ${order.name || ""}`,
+    `Edition: ${order.edition || ""}`,
+    `Order Number: ${order.razorpay_order_id || ""}`,
+    `Total Voice Notes: ${voiceNotes.length}`,
+    `Downloaded: ${new Date().toISOString()}`,
+    "",
+    "Files included:",
+  ]
+
+  let added = 0
+  for (let i = 0; i < voiceNotes.length; i++) {
+    const vn = voiceNotes[i]
+    if (!vn.file_path) continue
+
+    const buffer = await downloadStorageFileBuffer(STORAGE_BUCKETS.voiceNotes, vn.file_path)
+    if (!buffer) {
+      manifestLines.push(`  - [MISSING] ${vn.file_name || basenameFromPath(vn.file_path)}`)
+      continue
+    }
+
+    const originalName = vn.file_name || basenameFromPath(vn.file_path) || `voice-note-${i + 1}`
+    const safeName = safeFileName(originalName)
+    const numberedName = `${String(i + 1).padStart(2, "0")}-${safeName}`
+
+    archive.append(buffer, { name: numberedName })
+    manifestLines.push(`  ${i + 1}. ${numberedName} (${Math.round(Number(vn.duration_seconds || 0))}s)`)
+    added += 1
+  }
+
+  archive.append(manifestLines.join("\n") + "\n", { name: "MANIFEST.txt" })
+
+  if (added === 0) {
+    archive.append("No voice note files could be retrieved from storage.\n", { name: "ERROR.txt" })
+  }
+
+  await archive.finalize()
+}))
+
+/* =========================
+   PHASE 1: DOWNLOAD COVER MATERIAL AS ZIP
+========================= */
+app.get("/admin/orders/:id/download-cover-material", requireAdmin, adminAsync(async (req, res) => {
+  const id = adminRequireUuid(req.params.id, "order id")
+
+  const { data: order, error: orderErr } = await supabase
+    .from("orders")
+    .select("id, razorpay_order_id, name, edition, custom_cover_paid")
+    .eq("id", id)
+    .single()
+
+  if (orderErr || !order) {
+    if (orderErr?.code === "PGRST116") return adminJsonError(res, 404, "Order not found.")
+    return adminHandleSupabaseError(res, orderErr, "Unable to load order.")
+  }
+
+  // Find the latest submitted intake (or latest draft if none submitted)
+  const { data: intakes, error: intakeErr } = await supabase
+    .from("story_intakes")
+    .select("*")
+    .eq("order_id", id)
+    .order("updated_at", { ascending: false })
+
+  if (intakeErr) return adminHandleSupabaseError(res, intakeErr, "Unable to load story intake.")
+
+  const submittedIntake = (intakes || []).find((i) => i.submitted === true && i.submitted_at)
+  const intake = submittedIntake || (intakes || [])[0] || null
+
+  if (!intake) {
+    return adminJsonError(res, 404, "No story intake found for this order.")
+  }
+
+  const isCustomCover =
+    order.custom_cover_paid === true ||
+    String(intake.cover_mode || "").toLowerCase() === "custom"
+
+  const customerName = (order.name || "customer").replace(/[^a-zA-Z0-9 _-]/g, "_").trim() || "customer"
+  const orderRef = order.razorpay_order_id || id
+  const zipFileName = safeFileName(`cover-material-${customerName}-${orderRef}.zip`)
+
+  res.setHeader("Content-Type", "application/zip")
+  res.setHeader("Content-Disposition", `attachment; filename="${zipFileName}"`)
+  res.setHeader("Cache-Control", "no-store")
+
+  const archive = archiver("zip", { zlib: { level: 6 } })
+
+  archive.on("error", (err) => {
+    console.error("❌ Cover material archive error:", err)
+    if (!res.headersSent) {
+      res.status(500).json({ success: false, message: "Could not build zip" })
+    } else {
+      res.end()
+    }
+  })
+
+  archive.pipe(res)
+
+  // Always include a cover-info.txt with title, author, edition, custom notes if any
+  const infoLines = [
+    `SoulScript Legacy — Cover Material`,
+    `Customer: ${order.name || ""}`,
+    `Edition: ${order.edition || ""}`,
+    `Order Number: ${order.razorpay_order_id || ""}`,
+    `Cover Type: ${isCustomCover ? "CUSTOM (paid)" : "Default template"}`,
+    `Downloaded: ${new Date().toISOString()}`,
+    "",
+    "----------------------------------------",
+    "",
+    `Title: ${intake.title || intake.cover_title || "(not provided)"}`,
+    `Author Name: ${intake.author_name || "(not provided)"}`,
+    "",
+  ]
+
+  if (isCustomCover) {
+    infoLines.push("----------------------------------------")
+    infoLines.push("")
+    infoLines.push("CUSTOM COVER NOTES (customer's description):")
+    infoLines.push("")
+    infoLines.push(intake.custom_cover_notes || intake.cover_notes || "(no notes provided)")
+    infoLines.push("")
+  }
+
+  archive.append(infoLines.join("\n") + "\n", { name: "cover-info.txt" })
+
+  if (isCustomCover) {
+    // Custom cover: include up to 3 reference images
+    const referencePaths = normalizeStoragePathArray(intake.reference_image_paths, 10)
+
+    if (referencePaths.length === 0) {
+      archive.append(
+        "Customer purchased custom cover but no reference images were uploaded.\n",
+        { name: "REFERENCES-NOTE.txt" }
+      )
+    } else {
+      let added = 0
+      for (let i = 0; i < referencePaths.length; i++) {
+        const path = referencePaths[i]
+        const result = await downloadStorageFileWithFallback(
+          [
+            STORAGE_BUCKETS.coverReferences,
+            STORAGE_BUCKETS.reviewMedia,
+            STORAGE_BUCKETS.coverPhotos,
+          ],
+          path
+        )
+
+        if (!result) continue
+
+        const originalName = basenameFromPath(path) || `reference-${i + 1}`
+        const safeName = safeFileName(originalName)
+        const numberedName = `reference-${String(i + 1).padStart(2, "0")}-${safeName}`
+
+        archive.append(result.buffer, { name: numberedName })
+        added += 1
+      }
+
+      if (added === 0) {
+        archive.append(
+          "Reference images are listed in the database but could not be retrieved from storage.\n",
+          { name: "REFERENCES-ERROR.txt" }
+        )
+      }
+    }
+  } else {
+    // Default cover: include cover photo if any (Confession edition has none)
+    const coverPhotoPath = firstNonEmpty(intake.cover_photo_path, intake.photo_path)
+
+    if (!coverPhotoPath) {
+      if (order.edition === "Confession Edition") {
+        archive.append(
+          "Confession Edition uses title and author name only. No cover photo applies.\n",
+          { name: "COVER-PHOTO-NOTE.txt" }
+        )
+      } else {
+        archive.append(
+          "No cover photo was uploaded by the customer.\n",
+          { name: "COVER-PHOTO-NOTE.txt" }
+        )
+      }
+    } else {
+      const result = await downloadStorageFileWithFallback(
+        [
+          STORAGE_BUCKETS.coverPhotos,
+          STORAGE_BUCKETS.reviewMedia,
+          STORAGE_BUCKETS.coverReferences,
+        ],
+        coverPhotoPath
+      )
+
+      if (!result) {
+        archive.append(
+          `Cover photo path stored: ${coverPhotoPath}\nBut file could not be retrieved from storage.\n`,
+          { name: "COVER-PHOTO-ERROR.txt" }
+        )
+      } else {
+        const originalName = basenameFromPath(coverPhotoPath) || "cover-photo"
+        const safeName = safeFileName(originalName)
+        archive.append(result.buffer, { name: `cover-photo-${safeName}` })
+      }
+    }
+  }
+
+  await archive.finalize()
 }))
 
 app.get("/admin/orders/:id/files", requireAdmin, adminAsync(async (req, res) => {
@@ -3385,7 +3750,9 @@ app.post("/admin/orders/:id/send-story-reminder", requireAdmin, adminAsync(async
 }))
 
 /* =========================
-   ADMIN: UPLOAD REVIEW FILES (with legacy alias)
+   ADMIN: UPLOAD REVIEW FILES
+   PHASE 1: Now also accepts optional title and author_name
+   to fill in if customer didn't provide them in story intake.
 ========================= */
 async function handleAdminUploadReviewFiles(req, res) {
   const id = adminRequireUuid(req.params.id, "order id")
@@ -3393,6 +3760,10 @@ async function handleAdminUploadReviewFiles(req, res) {
   const manuscriptFile = uploadedFile(req, ["manuscript_pdf", "manuscriptPdf", "pdf"])
   const coverFile = uploadedFile(req, ["cover_file", "coverFile", "cover"])
   const managerNote = normalizeText(req.body?.manager_note ?? req.body?.managerNote ?? "", 4000) || null
+
+  // PHASE 1: Optional title and author_name from manager (if customer didn't provide them)
+  const managerTitle = normalizeText(req.body?.title ?? req.body?.cover_title ?? "", 300)
+  const managerAuthorName = normalizeText(req.body?.author_name ?? req.body?.authorName ?? "", 180)
 
   if (!manuscriptFile && !coverFile) {
     return adminJsonError(res, 400, "Upload manuscript PDF or cover file.")
@@ -3422,6 +3793,46 @@ async function handleAdminUploadReviewFiles(req, res) {
   if (orderErr || !order) {
     if (orderErr?.code === "PGRST116") return adminJsonError(res, 404, "Order not found.")
     return adminHandleSupabaseError(res, orderErr, "Unable to load order.")
+  }
+
+  // PHASE 1: If manager provided title/author, backfill them on the latest submitted intake
+  // ONLY if those fields are currently empty (we never overwrite customer-provided values)
+  if (managerTitle || managerAuthorName) {
+    const { data: latestSubmittedIntakes } = await supabase
+      .from("story_intakes")
+      .select("id, title, cover_title, author_name")
+      .eq("order_id", id)
+      .order("updated_at", { ascending: false })
+      .limit(1)
+
+    const latestIntake = (latestSubmittedIntakes || [])[0]
+
+    if (latestIntake) {
+      const intakeUpdate = {}
+
+      const existingTitle = firstNonEmpty(latestIntake.title, latestIntake.cover_title)
+      if (managerTitle && !existingTitle) {
+        intakeUpdate.title = managerTitle
+        intakeUpdate.cover_title = managerTitle
+      }
+
+      const existingAuthor = firstNonEmpty(latestIntake.author_name)
+      if (managerAuthorName && !existingAuthor) {
+        intakeUpdate.author_name = managerAuthorName
+      }
+
+      if (Object.keys(intakeUpdate).length > 0) {
+        intakeUpdate.updated_at = new Date().toISOString()
+        const { error: backfillErr } = await supabase
+          .from("story_intakes")
+          .update(intakeUpdate)
+          .eq("id", latestIntake.id)
+
+        if (backfillErr) {
+          console.error("⚠️ Manager title/author backfill failed:", backfillErr)
+        }
+      }
+    }
   }
 
   const now = new Date().toISOString()
@@ -3492,7 +3903,12 @@ async function handleAdminUploadReviewFiles(req, res) {
         bodyHtml:
           emailParagraph(`Dear ${escapeHtml(order.name || "SoulScript customer")},`) +
           emailParagraph("Your manuscript and cover review files are now available in your story portal.") +
-          emailParagraph("Please review them carefully. You can approve them for printing or request changes from the portal."),
+          emailParagraph("Please review them carefully. You can approve them for printing or request changes from the portal.") +
+          (managerNote
+            ? emailDivider() +
+              emailParagraph("<strong>A note from your team:</strong>") +
+              emailMuted(nl2br(managerNote))
+            : ""),
         ctaLabel: "Open Review Portal",
         ctaUrl: portalUrl,
       }),
@@ -3545,6 +3961,7 @@ app.patch("/admin/orders/:id", requireAdmin, adminAsync(async (req, res) => {
   if (adminHasOwn(req.body, "order_status")) updates.order_status = adminStringOrNull(req.body.order_status, "order_status", 80)
   if (adminHasOwn(req.body, "custom_cover_paid")) updates.custom_cover_paid = adminBoolean(req.body.custom_cover_paid, "custom_cover_paid")
   if (adminHasOwn(req.body, "voice_note_addon_paid")) updates.voice_note_addon_paid = adminBoolean(req.body.voice_note_addon_paid, "voice_note_addon_paid")
+  if (adminHasOwn(req.body, "white_labeling")) updates.white_labeling = adminBoolean(req.body.white_labeling, "white_labeling")
 
   if (Object.keys(updates).length === 0) return adminJsonError(res, 400, "No allowed order fields provided.")
 
@@ -3572,9 +3989,7 @@ app.patch("/admin/orders/:id/print-submission", requireAdmin, adminAsync(async (
 
   const updates = {}
 
-  // If either flag is true, treat as "submitted"
   const markingSubmitted = printSubmissionStatus === true || submittedToPrinter === true
-  // If either flag is explicitly false, treat as "un-submit"
   const markingUnsubmitted =
     !markingSubmitted &&
     (printSubmissionStatus === false || submittedToPrinter === false)
@@ -3664,7 +4079,6 @@ app.patch("/admin/orders/:id/shipment", requireAdmin, adminAsync(async (req, res
     return adminJsonError(res, 400, "No allowed shipment fields provided.")
   }
 
-  // Light status sync based on shipment_status, if it was provided.
   if (adminHasOwn(req.body, "shipment_status")) {
     const status = updates.shipment_status
     if (status === "under_printing") {
@@ -3691,7 +4105,6 @@ app.patch("/admin/orders/:id/shipment", requireAdmin, adminAsync(async (req, res
     return adminHandleSupabaseError(res, error, "Unable to update shipment.")
   }
 
-  // Best-effort: if delivered, stamp deliverables.delivered_at. Don't fail the route if column missing.
   if (updates.shipment_status === "delivered") {
     try {
       await supabase
@@ -4102,4 +4515,5 @@ app.listen(PORT, () => {
   console.log(`✅ STORY API       = Enabled`)
   console.log(`✅ STORAGE API     = Signed URLs enabled`)
   console.log(`✅ PRINT/SHIPMENT/PAYOUT/REVIEW-CHAT/REVENUE = Enabled`)
+  console.log(`✅ PHASE 1 DOWNLOADS = story.txt, voice-notes.zip, cover-material.zip`)
 })
