@@ -18,7 +18,7 @@ const { createClient } = require("@supabase/supabase-js")
 const app = express()
 
 const WHITE_LABELING_PRICE = 2000
-const EXTRA_WRITING_PRICE_PER_500 = 500
+const EXTRA_WRITING_PRICE_PER_WORD = 1
 
 const REVIEW_NOTIFICATION_EMAIL = process.env.REVIEW_NOTIFICATION_EMAIL || "chandan@soulscriptlegacy.com"
 
@@ -2119,7 +2119,7 @@ app.post("/story/create-extra-writing", async (req, res) => {
             return res.status(400).json({ error: "Request text is empty" })
         }
 
-        const amount = Math.ceil(wordCount / 500) * EXTRA_WRITING_PRICE_PER_500
+        const amount = wordCount * EXTRA_WRITING_PRICE_PER_WORD
 
         const receipt = `ssl_extrawrite_${Date.now()}`
         const razorpayOrder = await razorpay.orders.create({
