@@ -17,9 +17,32 @@ const { createClient } = require("@supabase/supabase-js")
 
 const app = express()
 
+const WHITE_LABELING_PRICE = 2000
+
+const REVIEW_NOTIFICATION_EMAIL = process.env.REVIEW_NOTIFICATION_EMAIL || "chandan@soulscriptlegacy.com"
+
+const CHAT_IMAGE_MAX_PER_MESSAGE = 10
+const CHAT_IMAGE_MAX_SIZE_BYTES = 5 * 1024 * 1024 // 5 MB
+const CHAT_IMAGE_ALLOWED_MIME = new Set(["image/jpeg", "image/png", "image/webp"])
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 50 * 1024 * 1024 },
+})
+
+const chatImageUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: CHAT_IMAGE_MAX_SIZE_BYTES,
+    files: CHAT_IMAGE_MAX_PER_MESSAGE,
+  },
+  fileFilter: (req, file, cb) => {
+    if (CHAT_IMAGE_ALLOWED_MIME.has(file.mimetype)) {
+      cb(null, true)
+    } else {
+      cb(new Error("Only JPG, PNG, or WEBP images are allowed."))
+    }
+  },
 })
 
 /* =========================
@@ -375,6 +398,7 @@ const STORAGE_BUCKETS = {
   reviewFiles: process.env.SUPABASE_REVIEW_FILES_BUCKET || "review-files",
   reviewMedia: process.env.SUPABASE_REVIEW_MEDIA_BUCKET || "review-media",
   polaroids: process.env.SUPABASE_POLAROIDS_BUCKET || "polaroid-photos",
+  revisionChatMedia: process.env.SUPABASE_REVISION_CHAT_MEDIA_BUCKET || "revision_chat_media",
 }
 
 function cleanStoragePath(path) {
@@ -663,6 +687,53 @@ function uploadedFile(req, names) {
   return null
 }
 
+async function uploadRevisionChatImage(orderId, file) {
+  if (!file) return null
+
+  const timestamp = Date.now()
+  const extension = fileExtensionFor(file, "jpg")
+  const name = safeFileName(file.originalname || `chat-image.${extension}`)
+  const path = `${orderId}/${timestamp}-${Math.random().toString(36).slice(2, 8)}-${name}`
+
+  const { error } = await supabase.storage
+    .from(STORAGE_BUCKETS.revisionChatMedia)
+    .upload(path, file.buffer, {
+      contentType: file.mimetype || "image/jpeg",
+      upsert: false,
+    })
+
+  if (error) {
+    console.error("❌ Chat image upload failed:", { path, error })
+    throw new Error("Could not upload chat image.")
+  }
+
+  return path
+}
+
+async function withSignedChatMessages(messages = []) {
+  return Promise.all(
+    (messages || []).map(async (msg) => {
+      const attachments = Array.isArray(msg.attachments) ? msg.attachments : []
+      const signedAttachments = await Promise.all(
+        attachments.map(async (att) => {
+          const path = typeof att === "string" ? att : att?.path
+          if (!path) return att
+          const signedUrl = await createSignedUrl(STORAGE_BUCKETS.revisionChatMedia, path)
+          return {
+            path,
+            file_name: typeof att === "object" ? att?.file_name || basenameFromPath(path) : basenameFromPath(path),
+            signed_url: signedUrl,
+          }
+        })
+      )
+      return {
+        ...msg,
+        attachments: signedAttachments,
+      }
+    })
+  )
+}
+
 async function getNextReviewVersion(orderId) {
   const { data, error } = await supabase
     .from("review_files")
@@ -809,6 +880,7 @@ const ADDON_PRICES = {
   extra_softcover_copy: 399,
   extra_hardcover_copy: 499,
   extra_polaroids_pack: 249,
+  white_labeling: 2000,
 }
 
 function calculateCheckoutAmount({ edition, paymentType, ultraPriority }) {
@@ -856,6 +928,7 @@ function getAddonAmount({ addonType, quantity = 1, customAmount }) {
   if (addonType === "extra_softcover_copy") return ADDON_PRICES.extra_softcover_copy * qty
   if (addonType === "extra_hardcover_copy") return ADDON_PRICES.extra_hardcover_copy * qty
   if (addonType === "extra_polaroids_pack") return ADDON_PRICES.extra_polaroids_pack * qty
+  if (addonType === "white_labeling") return ADDON_PRICES.white_labeling
 
   if (addonType === "revision_charge") {
     const amount = Number(customAmount || 0)
@@ -1161,6 +1234,20 @@ app.get("/health", (req, res) => {
       "GET /admin/orders/:id/download-voice-notes",
       "GET /admin/orders/:id/download-cover-material",
     ],
+    phase2Endpoints: [
+      "POST /story/create-balance-payment",
+      "POST /story/confirm-balance-payment",
+      "POST /story/create-cart-payment",
+      "POST /story/confirm-cart-payment",
+      "POST /story/upload-polaroid-photo",
+      "POST /portal/revision-chat-message",
+      "GET /portal/revision-chat-messages",
+      "POST /portal/revision-chat-upload-image",
+      "GET /admin/orders/:id/revision-chat-messages",
+      "POST /admin/orders/:id/revision-chat-message",
+    ],
+    whiteLabelingPrice: WHITE_LABELING_PRICE,
+    reviewNotificationEmail: REVIEW_NOTIFICATION_EMAIL,
   })
 })
 
@@ -2682,6 +2769,15 @@ app.post("/story/proceed-print", async (req, res) => {
     const order = await getOrderByIdOrRazorpay(orderId)
     if (!order) return res.status(404).json({ error: "Order not found" })
 
+    const balanceDue = Number(order.balance_due || 0)
+    if (Number.isFinite(balanceDue) && balanceDue > 0) {
+      return res.status(402).json({
+        error: "Balance payment required before proceeding to print.",
+        balanceDue,
+        requiresBalancePayment: true,
+      })
+    }
+
     const now = new Date().toISOString()
 
     const { data, error } = await supabase
@@ -2743,6 +2839,600 @@ app.post("/story/proceed-print", async (req, res) => {
   } catch (err) {
     console.error("❌ /story/proceed-print error:", safeErr(err))
     return res.status(500).json({ error: "Could not proceed with print" })
+  }
+})
+
+
+app.post("/story/create-balance-payment", async (req, res) => {
+  try {
+    const { orderId } = req.body
+    const order = await getOrderByIdOrRazorpay(orderId)
+    if (!order) return res.status(404).json({ error: "Order not found" })
+
+    const balanceDue = Number(order.balance_due || 0)
+    if (!Number.isFinite(balanceDue) || balanceDue <= 0) {
+      return res.status(400).json({ error: "No balance due on this order." })
+    }
+
+    const receipt = `ssl_balance_${Date.now()}`
+
+    const razorpayOrder = await razorpay.orders.create({
+      amount: balanceDue * 100,
+      currency: "INR",
+      receipt,
+      notes: {
+        flow: "balance_payment",
+        orderId: order.id,
+        razorpayOrderId: order.razorpay_order_id,
+        balanceDue: String(balanceDue),
+        customerEmail: order.email,
+      },
+    })
+
+    await supabase
+      .from("orders")
+      .update({ balance_razorpay_order_id: razorpayOrder.id })
+      .eq("id", order.id)
+
+    return res.json({
+      success: true,
+      keyId: getRazorpayPublicKey(),
+      razorpayKeyId: getRazorpayPublicKey(),
+      razorpayOrderId: razorpayOrder.id,
+      amount: razorpayOrder.amount,
+      currency: razorpayOrder.currency,
+      amountRupees: balanceDue,
+    })
+  } catch (err) {
+    console.error("❌ /story/create-balance-payment error:", safeErr(err))
+    return res.status(500).json({ error: err?.message || "Could not create balance payment" })
+  }
+})
+
+app.post("/story/confirm-balance-payment", async (req, res) => {
+  try {
+    const { razorpay_payment_id, razorpay_order_id, razorpay_signature } = req.body
+
+    if (!razorpay_payment_id || !razorpay_order_id || !razorpay_signature) {
+      return res.status(400).json({ error: "Missing payment verification data" })
+    }
+
+    const expectedSignature = crypto
+      .createHmac("sha256", RAZORPAY_KEY_SECRET)
+      .update(razorpay_order_id + "|" + razorpay_payment_id)
+      .digest("hex")
+
+    if (expectedSignature !== razorpay_signature) {
+      return res.status(400).json({ error: "Invalid payment signature" })
+    }
+
+    const { data: order, error: orderErr } = await supabase
+      .from("orders")
+      .select("*")
+      .eq("balance_razorpay_order_id", razorpay_order_id)
+      .single()
+
+    if (orderErr || !order) {
+      return res.status(404).json({ error: "No order found for this balance payment." })
+    }
+
+    const now = new Date().toISOString()
+    const newPaidAmount = Number(order.paid_amount || 0) + Number(order.balance_due || 0)
+
+    await supabase
+      .from("orders")
+      .update({
+        paid_amount: newPaidAmount,
+        balance_due: 0,
+        pending_amount: 0,
+        balance_razorpay_payment_id: razorpay_payment_id,
+        balance_paid_at: now,
+      })
+      .eq("id", order.id)
+
+    await sendEmailSafe({
+      to: ADMIN_EMAIL,
+      subject: `Balance payment received — ${order.edition}`,
+      html: brandedEmailTemplate({
+        title: "Balance payment received",
+        bodyHtml:
+          emailParagraph("A customer has paid their pending balance.") +
+          emailDetails([
+            { label: "Order", value: order.razorpay_order_id || order.id },
+            { label: "Customer", value: order.name || "" },
+            { label: "Email", value: order.email || "" },
+            { label: "Balance paid", value: `₹${order.balance_due}` },
+            { label: "Razorpay payment ID", value: razorpay_payment_id },
+          ]),
+      }),
+    })
+
+    await sendEmailSafe({
+      to: order.email,
+      subject: "Your balance payment is received",
+      html: brandedEmailTemplate({
+        title: "Balance payment received",
+        bodyHtml:
+          emailParagraph(`Dear ${escapeHtml(order.name || "")},`) +
+          emailParagraph("We've received your balance payment. You can now proceed your book to print from your story portal."),
+        ctaLabel: "Open Story Portal",
+        ctaUrl: `${PORTAL_BASE_URL}/story?order=${encodeURIComponent(order.razorpay_order_id || "")}`,
+      }),
+    })
+
+    return res.json({ success: true, balancePaid: true })
+  } catch (err) {
+    console.error("❌ /story/confirm-balance-payment error:", safeErr(err))
+    return res.status(500).json({ error: "Balance payment confirmation failed" })
+  }
+})
+
+const ALLOWED_CART_ADDON_TYPES = new Set([
+  "white_labeling",
+  "extra_polaroids_pack",
+  "extra_softcover_copy",
+  "extra_hardcover_copy",
+])
+
+app.post("/story/create-cart-payment", async (req, res) => {
+  try {
+    const { orderId, items } = req.body
+
+    const order = await getOrderByIdOrRazorpay(orderId)
+    if (!order) return res.status(404).json({ error: "Order not found" })
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: "Cart is empty." })
+    }
+
+    const validatedItems = []
+    let totalAmount = 0
+
+    for (const item of items) {
+      const addonType = String(item?.addonType || "").trim()
+      const quantity = Math.max(1, Number(item?.quantity || 1))
+
+      if (!ALLOWED_CART_ADDON_TYPES.has(addonType)) {
+        return res.status(400).json({ error: `Invalid item type: ${addonType}` })
+      }
+
+      if (addonType === "white_labeling") {
+        const lockedStatuses = ["print_requested", "sent_to_print", "delivered", "completed", "in_transit"]
+        if (lockedStatuses.includes(String(order.production_status || "").toLowerCase())) {
+          return res.status(400).json({ error: "White labeling cannot be added after the book has been sent for printing." })
+        }
+        if (quantity > 1) {
+          return res.status(400).json({ error: "White labeling can only be purchased once." })
+        }
+      }
+
+      if (addonType === "extra_hardcover_copy" && order.edition === "Confession Edition") {
+        return res.status(400).json({ error: "Hardcover extra copy is not available for Confession Edition." })
+      }
+
+      const unitPrice = ADDON_PRICES[addonType]
+      if (!unitPrice) {
+        return res.status(400).json({ error: `Price not configured for: ${addonType}` })
+      }
+
+      const itemTotal = addonType === "white_labeling" ? unitPrice : unitPrice * quantity
+      totalAmount += itemTotal
+
+      validatedItems.push({
+        addonType,
+        quantity,
+        unitPrice,
+        amount: itemTotal,
+      })
+    }
+
+    if (totalAmount <= 0) {
+      return res.status(400).json({ error: "Cart total must be greater than zero." })
+    }
+
+    const receipt = `ssl_cart_${Date.now()}`
+
+    const razorpayOrder = await razorpay.orders.create({
+      amount: totalAmount * 100,
+      currency: "INR",
+      receipt,
+      notes: {
+        flow: "story_cart",
+        orderId: order.id,
+        razorpayOrderId: order.razorpay_order_id,
+        totalAmount: String(totalAmount),
+        itemCount: String(validatedItems.length),
+        customerEmail: order.email,
+      },
+    })
+
+    const { data: cartPayment, error: cartErr } = await supabase
+      .from("cart_payments")
+      .insert({
+        order_id: order.id,
+        razorpay_order_id: razorpayOrder.id,
+        total_amount: totalAmount,
+        items: validatedItems,
+        payment_status: "pending",
+      })
+      .select("*")
+      .single()
+
+    if (cartErr) {
+      console.error("❌ Cart payment insert failed:", cartErr)
+      return res.status(500).json({ error: "Could not create cart payment record." })
+    }
+
+    return res.json({
+      success: true,
+      keyId: getRazorpayPublicKey(),
+      razorpayKeyId: getRazorpayPublicKey(),
+      razorpayOrderId: razorpayOrder.id,
+      amount: razorpayOrder.amount,
+      currency: razorpayOrder.currency,
+      amountRupees: totalAmount,
+      cartPaymentId: cartPayment.id,
+      validatedItems,
+    })
+  } catch (err) {
+    console.error("❌ /story/create-cart-payment error:", safeErr(err))
+    return res.status(400).json({ error: err?.message || "Could not create cart payment" })
+  }
+})
+
+app.post("/story/confirm-cart-payment", async (req, res) => {
+  try {
+    const { razorpay_payment_id, razorpay_order_id, razorpay_signature } = req.body
+
+    if (!razorpay_payment_id || !razorpay_order_id || !razorpay_signature) {
+      return res.status(400).json({ error: "Missing payment verification data" })
+    }
+
+    const expectedSignature = crypto
+      .createHmac("sha256", RAZORPAY_KEY_SECRET)
+      .update(razorpay_order_id + "|" + razorpay_payment_id)
+      .digest("hex")
+
+    if (expectedSignature !== razorpay_signature) {
+      return res.status(400).json({ error: "Invalid payment signature" })
+    }
+
+    const { data: cartPayment, error: cartErr } = await supabase
+      .from("cart_payments")
+      .select("*")
+      .eq("razorpay_order_id", razorpay_order_id)
+      .single()
+
+    if (cartErr || !cartPayment) {
+      return res.status(404).json({ error: "Cart payment record not found." })
+    }
+
+    if (cartPayment.payment_status === "paid") {
+      return res.json({ success: true, alreadyPaid: true, cart_payment: cartPayment })
+    }
+
+    const now = new Date().toISOString()
+
+    await supabase
+      .from("cart_payments")
+      .update({
+        payment_status: "paid",
+        razorpay_payment_id,
+        paid_at: now,
+      })
+      .eq("id", cartPayment.id)
+
+    const items = Array.isArray(cartPayment.items) ? cartPayment.items : []
+    const polaroidUploadSlots = []
+
+    for (const item of items) {
+      const addonType = item.addonType
+      const quantity = Number(item.quantity || 1)
+      const unitPrice = Number(item.unitPrice || 0)
+      const amount = Number(item.amount || 0)
+
+      const { data: addon, error: addonErr } = await supabase
+        .from("order_addons")
+        .insert({
+          order_id: cartPayment.order_id,
+          addon_type: addonType,
+          title: addonType,
+          quantity,
+          unit_price: unitPrice,
+          amount,
+          status: "paid",
+          payment_status: "paid",
+          razorpay_order_id,
+          razorpay_payment_id,
+          paid_at: now,
+          cart_payment_id: cartPayment.id,
+          metadata: { source: "cart_payment" },
+        })
+        .select("*")
+        .single()
+
+      if (addonErr) {
+        console.error("⚠️ Cart addon insert failed:", { addonType, error: addonErr })
+        continue
+      }
+
+      if (addonType === "white_labeling") {
+        await supabase
+          .from("orders")
+          .update({ white_labeling: true })
+          .eq("id", cartPayment.order_id)
+      }
+
+      if (addonType === "extra_softcover_copy" || addonType === "extra_hardcover_copy") {
+        await supabase.from("print_addons").insert({
+          order_id: cartPayment.order_id,
+          addon_id: addon.id,
+          addon_type: addonType,
+          quantity,
+          amount,
+          payment_status: "paid",
+        })
+      }
+
+      if (addonType === "extra_polaroids_pack") {
+        for (let pack = 0; pack < quantity; pack++) {
+          polaroidUploadSlots.push({
+            cart_payment_id: cartPayment.id,
+            addon_id: addon.id,
+            pack_index: pack,
+          })
+        }
+      }
+    }
+
+    await supabase
+      .from("orders")
+      .update({
+        cart_payments_total: Number(cartPayment.total_amount || 0),
+        last_cart_payment_at: now,
+      })
+      .eq("id", cartPayment.order_id)
+
+    await refreshOrderTotals(cartPayment.order_id)
+
+    const { data: order } = await supabase
+      .from("orders")
+      .select("*")
+      .eq("id", cartPayment.order_id)
+      .single()
+
+    await sendEmailSafe({
+      to: ADMIN_EMAIL,
+      subject: `Cart payment received — ₹${cartPayment.total_amount}`,
+      html: brandedEmailTemplate({
+        title: "Cart payment received",
+        bodyHtml:
+          emailParagraph("A customer has completed a cart payment.") +
+          emailDetails([
+            { label: "Order", value: order?.razorpay_order_id || cartPayment.order_id },
+            { label: "Customer", value: order?.name || "" },
+            { label: "Email", value: order?.email || "" },
+            { label: "Total amount", value: `₹${cartPayment.total_amount}` },
+            { label: "Items", value: items.map((i) => `${i.addonType} × ${i.quantity}`).join(", "), html: false },
+          ]),
+      }),
+    })
+
+    return res.json({
+      success: true,
+      cart_payment: { ...cartPayment, payment_status: "paid", paid_at: now, razorpay_payment_id },
+      polaroidUploadSlots,
+    })
+  } catch (err) {
+    console.error("❌ /story/confirm-cart-payment error:", safeErr(err))
+    return res.status(500).json({ error: "Cart payment confirmation failed" })
+  }
+})
+
+app.post(
+  "/story/upload-polaroid-photo",
+  upload.single("photo"),
+  async (req, res) => {
+    try {
+      const { orderId, cartPaymentId, packIndex } = req.body
+      const file = req.file
+
+      if (!file) {
+        return res.status(400).json({ error: "Photo file required." })
+      }
+
+      if (!CHAT_IMAGE_ALLOWED_MIME.has(file.mimetype)) {
+        return res.status(400).json({ error: "Only JPG, PNG, or WEBP photos are allowed." })
+      }
+
+      const order = await getOrderByIdOrRazorpay(orderId)
+      if (!order) return res.status(404).json({ error: "Order not found" })
+
+      const packIdx = Number(packIndex || 0)
+
+      const timestamp = Date.now()
+      const extension = fileExtensionFor(file, "jpg")
+      const name = safeFileName(file.originalname || `polaroid.${extension}`)
+      const path = `${order.id}/cart-${cartPaymentId || "unknown"}/pack-${packIdx}/${timestamp}-${name}`
+
+      const { error: uploadErr } = await supabase.storage
+        .from(STORAGE_BUCKETS.polaroids)
+        .upload(path, file.buffer, {
+          contentType: file.mimetype,
+          upsert: false,
+        })
+
+      if (uploadErr) {
+        console.error("❌ Polaroid upload failed:", uploadErr)
+        return res.status(500).json({ error: "Could not upload photo." })
+      }
+
+      const { data: photo, error: photoErr } = await supabase
+        .from("polaroid_photos")
+        .insert({
+          order_id: order.id,
+          cart_payment_id: cartPaymentId || null,
+          pack_index: packIdx,
+          file_path: path,
+        })
+        .select("*")
+        .single()
+
+      if (photoErr) {
+        console.error("❌ Polaroid record insert failed:", photoErr)
+        return res.status(500).json({ error: "Could not save photo record." })
+      }
+
+      const signedUrl = await createSignedUrl(STORAGE_BUCKETS.polaroids, path)
+
+      return res.json({
+        success: true,
+        photo: { ...photo, signed_url: signedUrl },
+      })
+    } catch (err) {
+      console.error("❌ /story/upload-polaroid-photo error:", safeErr(err))
+      return res.status(500).json({ error: "Polaroid upload failed" })
+    }
+  }
+)
+
+app.get("/portal/revision-chat-messages", async (req, res) => {
+  try {
+    const { orderId } = req.query
+    const order = await getOrderByIdOrRazorpay(orderId)
+    if (!order) return res.status(404).json({ error: "Order not found" })
+
+    const { data: messages, error } = await supabase
+      .from("revision_chat_messages")
+      .select("*")
+      .eq("order_id", order.id)
+      .order("created_at", { ascending: true })
+
+    if (error) {
+      console.error("❌ Chat messages fetch failed:", error)
+      return res.status(500).json({ error: "Could not load chat messages." })
+    }
+
+    await supabase
+      .from("revision_chat_messages")
+      .update({ is_read_by_customer: true })
+      .eq("order_id", order.id)
+      .eq("sender_type", "admin")
+      .eq("is_read_by_customer", false)
+
+    const signedMessages = await withSignedChatMessages(messages || [])
+
+    return res.json({ success: true, messages: signedMessages })
+  } catch (err) {
+    console.error("❌ /portal/revision-chat-messages error:", safeErr(err))
+    return res.status(500).json({ error: "Could not load chat messages" })
+  }
+})
+
+app.post(
+  "/portal/revision-chat-upload-image",
+  chatImageUpload.array("images", CHAT_IMAGE_MAX_PER_MESSAGE),
+  async (req, res) => {
+    try {
+      const { orderId } = req.body
+      const order = await getOrderByIdOrRazorpay(orderId)
+      if (!order) return res.status(404).json({ error: "Order not found" })
+
+      const files = Array.isArray(req.files) ? req.files : []
+
+      if (files.length === 0) {
+        return res.status(400).json({ error: "No images uploaded." })
+      }
+
+      if (files.length > CHAT_IMAGE_MAX_PER_MESSAGE) {
+        return res.status(400).json({ error: `Max ${CHAT_IMAGE_MAX_PER_MESSAGE} images per message.` })
+      }
+
+      const uploaded = []
+      for (const file of files) {
+        const path = await uploadRevisionChatImage(order.id, file)
+        const signedUrl = await createSignedUrl(STORAGE_BUCKETS.revisionChatMedia, path)
+        uploaded.push({
+          path,
+          file_name: file.originalname || basenameFromPath(path),
+          signed_url: signedUrl,
+        })
+      }
+
+      return res.json({ success: true, uploaded })
+    } catch (err) {
+      console.error("❌ /portal/revision-chat-upload-image error:", safeErr(err))
+      return res.status(500).json({ error: err?.message || "Image upload failed" })
+    }
+  }
+)
+
+app.post("/portal/revision-chat-message", async (req, res) => {
+  try {
+    const { orderId, message, attachments } = req.body
+    const order = await getOrderByIdOrRazorpay(orderId)
+    if (!order) return res.status(404).json({ error: "Order not found" })
+
+    const cleanMessage = normalizeText(message, 4000)
+    const cleanAttachments = Array.isArray(attachments)
+      ? attachments
+          .filter((att) => att && (typeof att === "string" || att.path))
+          .slice(0, CHAT_IMAGE_MAX_PER_MESSAGE)
+          .map((att) => {
+            if (typeof att === "string") return { path: att, file_name: basenameFromPath(att) }
+            return {
+              path: String(att.path),
+              file_name: String(att.file_name || basenameFromPath(att.path)),
+            }
+          })
+      : []
+
+    if (!cleanMessage && cleanAttachments.length === 0) {
+      return res.status(400).json({ error: "Message text or images required." })
+    }
+
+    const { data: inserted, error: insertErr } = await supabase
+      .from("revision_chat_messages")
+      .insert({
+        order_id: order.id,
+        sender_type: "customer",
+        sender_name: order.name || null,
+        message: cleanMessage || null,
+        attachments: cleanAttachments,
+        is_read_by_customer: true,
+        is_read_by_admin: false,
+      })
+      .select("*")
+      .single()
+
+    if (insertErr) {
+      console.error("❌ Customer chat message insert failed:", insertErr)
+      return res.status(500).json({ error: "Could not send message." })
+    }
+
+    await sendEmailSafe({
+      to: REVIEW_NOTIFICATION_EMAIL,
+      subject: `New review chat message — ${order.name || "Customer"}`,
+      html: brandedEmailTemplate({
+        title: "New customer message",
+        bodyHtml:
+          emailParagraph("A customer has sent a new message in the review chat.") +
+          emailDetails([
+            { label: "Order", value: order.razorpay_order_id || order.id },
+            { label: "Customer", value: order.name || "" },
+            { label: "Email", value: order.email || "" },
+            { label: "Edition", value: order.edition || "" },
+            { label: "Message", value: nl2br(cleanMessage || "(images only)"), html: true },
+            { label: "Images", value: cleanAttachments.length ? `${cleanAttachments.length} attached` : "None" },
+          ]),
+      }),
+    })
+
+    const signed = (await withSignedChatMessages([inserted]))[0]
+    return res.json({ success: true, message: signed })
+  } catch (err) {
+    console.error("❌ /portal/revision-chat-message error:", safeErr(err))
+    return res.status(500).json({ error: "Could not send chat message" })
   }
 })
 
@@ -4257,6 +4947,108 @@ app.post("/admin/revisions/:id/messages", requireAdmin, adminAsync(async (req, r
   return res.json({ success: true, message: inserted })
 }))
 
+
+app.get("/admin/orders/:id/revision-chat-messages", requireAdmin, adminAsync(async (req, res) => {
+  const id = adminRequireUuid(req.params.id, "order id")
+
+  const { data: messages, error } = await supabase
+    .from("revision_chat_messages")
+    .select("*")
+    .eq("order_id", id)
+    .order("created_at", { ascending: true })
+
+  if (error) return adminHandleSupabaseError(res, error, "Unable to load chat messages.")
+
+  await supabase
+    .from("revision_chat_messages")
+    .update({ is_read_by_admin: true })
+    .eq("order_id", id)
+    .eq("sender_type", "customer")
+    .eq("is_read_by_admin", false)
+
+  const signedMessages = await withSignedChatMessages(messages || [])
+
+  return res.json({ success: true, messages: signedMessages })
+}))
+
+app.post(
+  "/admin/orders/:id/revision-chat-message",
+  requireAdmin,
+  chatImageUpload.array("images", CHAT_IMAGE_MAX_PER_MESSAGE),
+  adminAsync(async (req, res) => {
+    const id = adminRequireUuid(req.params.id, "order id")
+
+    const cleanMessage = normalizeText(req.body?.message, 4000)
+    const files = Array.isArray(req.files) ? req.files : []
+
+    if (!cleanMessage && files.length === 0) {
+      return adminJsonError(res, 400, "Message text or images required.")
+    }
+
+    if (files.length > CHAT_IMAGE_MAX_PER_MESSAGE) {
+      return adminJsonError(res, 400, `Max ${CHAT_IMAGE_MAX_PER_MESSAGE} images per message.`)
+    }
+
+    const { data: order, error: orderErr } = await supabase
+      .from("orders")
+      .select("id, razorpay_order_id, name, email")
+      .eq("id", id)
+      .single()
+
+    if (orderErr || !order) {
+      if (orderErr?.code === "PGRST116") return adminJsonError(res, 404, "Order not found.")
+      return adminHandleSupabaseError(res, orderErr, "Unable to load order.")
+    }
+
+    const uploadedAttachments = []
+    for (const file of files) {
+      const path = await uploadRevisionChatImage(id, file)
+      uploadedAttachments.push({
+        path,
+        file_name: file.originalname || basenameFromPath(path),
+      })
+    }
+
+    const { data: inserted, error: insertErr } = await supabase
+      .from("revision_chat_messages")
+      .insert({
+        order_id: id,
+        sender_type: "admin",
+        sender_name: req.admin?.email || "SoulScript Team",
+        message: cleanMessage || null,
+        attachments: uploadedAttachments,
+        is_read_by_admin: true,
+        is_read_by_customer: false,
+      })
+      .select("*")
+      .single()
+
+    if (insertErr) {
+      return adminHandleSupabaseError(res, insertErr, "Could not send message.")
+    }
+
+    if (order.email) {
+      const portalUrl = `${PORTAL_BASE_URL}/story?order=${encodeURIComponent(order.razorpay_order_id || "")}`
+      await sendEmailSafe({
+        to: order.email,
+        subject: "New message about your novel",
+        html: brandedEmailTemplate({
+          title: "You have a new message",
+          bodyHtml:
+            emailParagraph(`Dear ${escapeHtml(order.name || "")},`) +
+            emailParagraph("Our team has sent you a new message about your novel review. Please check your story portal to view and reply.") +
+            (cleanMessage ? emailDivider() + emailMuted(nl2br(cleanMessage)) : ""),
+          ctaLabel: "Open Story Portal",
+          ctaUrl: portalUrl,
+        }),
+      })
+    }
+
+    const signed = (await withSignedChatMessages([inserted]))[0]
+    return res.json({ success: true, message: signed })
+  })
+)
+
 /* =========================
    ADMIN: REVENUE
 ========================= */
@@ -4516,4 +5308,5 @@ app.listen(PORT, () => {
   console.log(`✅ STORAGE API     = Signed URLs enabled`)
   console.log(`✅ PRINT/SHIPMENT/PAYOUT/REVIEW-CHAT/REVENUE = Enabled`)
   console.log(`✅ PHASE 1 DOWNLOADS = story.txt, voice-notes.zip, cover-material.zip`)
+  console.log(`✅ PHASE 2 = Balance gate, cart payments, review chat, white labeling`)
 })
