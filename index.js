@@ -556,13 +556,26 @@ const coverPhotoUrl = await createSignedUrlWithFallback(
 
 async function withSignedCoverReferenceImages(images = []) {
   return Promise.all(
-    (images || []).map(async (image) => ({
-      ...image,
-  signed_url: await createSignedUrlWithFallback(
-  [STORAGE_BUCKETS.reviewMedia, STORAGE_BUCKETS.coverReferences, STORAGE_BUCKETS.coverPhotos],
-  path
-),
-    }))
+    (images || []).map(async (image) => {
+      const imagePath = firstNonEmpty(image.file_path, image.path)
+
+      const signedUrl = await createSignedUrlWithFallback(
+        [
+          STORAGE_BUCKETS.reviewMedia,
+          STORAGE_BUCKETS.coverReferences,
+          STORAGE_BUCKETS.coverPhotos,
+        ],
+        imagePath
+      )
+
+      return {
+        ...image,
+        signed_url: signedUrl,
+        url: signedUrl,
+        file_url: signedUrl,
+        download_url: signedUrl,
+      }
+    })
   )
 }
 
