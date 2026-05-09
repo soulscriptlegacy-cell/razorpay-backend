@@ -18,6 +18,7 @@ const { createClient } = require("@supabase/supabase-js")
 const app = express()
 
 const WHITE_LABELING_PRICE = 2000
+const EXTRA_WRITING_PRICE_PER_500 = 500
 
 const REVIEW_NOTIFICATION_EMAIL = process.env.REVIEW_NOTIFICATION_EMAIL || "chandan@soulscriptlegacy.com"
 
@@ -1246,6 +1247,12 @@ app.get("/health", (req, res) => {
       "GET /admin/orders/:id/revision-chat-messages",
       "POST /admin/orders/:id/revision-chat-message",
     ],
+    phase3Endpoints: [
+      "POST /story/create-extra-writing",
+      "POST /story/confirm-extra-writing",
+      "GET /admin/extra-writing-requests",
+      "PATCH /admin/extra-writing-requests/:id",
+    ],
     whiteLabelingPrice: WHITE_LABELING_PRICE,
     reviewNotificationEmail: REVIEW_NOTIFICATION_EMAIL,
   })
@@ -2096,6 +2103,152 @@ app.get("/portal-order", async (req, res) => {
 /* =========================
    STORY PORTAL API
 ========================= */
+app.post("/story/create-extra-writing", async (req, res) => {
+    try {
+        const { orderId, requestText } = req.body
+        const order = await getOrderByIdOrRazorpay(orderId)
+        if (!order) return res.status(404).json({ error: "Order not found" })
+
+        const cleanText = normalizeText(requestText, 30000)
+        if (!cleanText) {
+            return res.status(400).json({ error: "Request text is required" })
+        }
+
+        const wordCount = cleanText.split(/\s+/).filter(Boolean).length
+        if (wordCount < 1) {
+            return res.status(400).json({ error: "Request text is empty" })
+        }
+
+        const amount = Math.ceil(wordCount / 500) * EXTRA_WRITING_PRICE_PER_500
+
+        const receipt = `ssl_extrawrite_${Date.now()}`
+        const razorpayOrder = await razorpay.orders.create({
+            amount: amount * 100,
+            currency: "INR",
+            receipt,
+            notes: {
+                flow: "extra_writing",
+                orderId: order.id,
+                razorpayOrderId: order.razorpay_order_id,
+                wordCount: String(wordCount),
+                amount: String(amount),
+                customerEmail: order.email,
+            },
+        })
+
+        const { data: request, error: insertErr } = await supabase
+            .from("extra_writing_requests")
+            .insert({
+                order_id: order.id,
+                request_text: cleanText,
+                word_count: wordCount,
+                amount,
+                razorpay_order_id: razorpayOrder.id,
+                payment_status: "pending",
+                status: "pending",
+            })
+            .select("*")
+            .single()
+
+        if (insertErr) {
+            console.error("Extra writing insert failed:", insertErr)
+            return res.status(500).json({ error: "Could not create request" })
+        }
+
+        return res.json({
+            success: true,
+            keyId: RAZORPAY_KEY_ID,
+            razorpayKeyId: RAZORPAY_KEY_ID,
+            razorpayOrderId: razorpayOrder.id,
+            amount: razorpayOrder.amount,
+            currency: razorpayOrder.currency,
+            amountRupees: amount,
+            wordCount,
+            extraWritingId: request.id,
+        })
+    } catch (err) {
+        console.error("/story/create-extra-writing error:", safeErr(err))
+        return res.status(500).json({ error: err?.message || "Could not start extra writing payment" })
+    }
+})
+
+app.post("/story/confirm-extra-writing", async (req, res) => {
+    try {
+        const { razorpay_payment_id, razorpay_order_id, razorpay_signature } = req.body
+
+        if (!razorpay_payment_id || !razorpay_order_id || !razorpay_signature) {
+            return res.status(400).json({ error: "Missing payment verification data" })
+        }
+
+        const expectedSignature = crypto
+            .createHmac("sha256", RAZORPAY_KEY_SECRET)
+            .update(razorpay_order_id + "|" + razorpay_payment_id)
+            .digest("hex")
+
+        if (expectedSignature !== razorpay_signature) {
+            return res.status(400).json({ error: "Invalid payment signature" })
+        }
+
+        const { data: request, error: requestErr } = await supabase
+            .from("extra_writing_requests")
+            .select("*")
+            .eq("razorpay_order_id", razorpay_order_id)
+            .single()
+
+        if (requestErr || !request) {
+            return res.status(404).json({ error: "Extra writing request not found" })
+        }
+
+        if (request.payment_status === "paid") {
+            return res.json({ success: true, alreadyPaid: true, request })
+        }
+
+        const now = new Date().toISOString()
+
+        await supabase
+            .from("extra_writing_requests")
+            .update({
+                payment_status: "paid",
+                razorpay_payment_id,
+                paid_at: now,
+            })
+            .eq("id", request.id)
+
+        const { data: order } = await supabase
+            .from("orders")
+            .select("*")
+            .eq("id", request.order_id)
+            .single()
+
+        await sendEmailSafe({
+            to: REVIEW_NOTIFICATION_EMAIL,
+            subject: `New paid extra writing request — ${order?.name || "Customer"} — ₹${request.amount}`,
+            html: brandedEmailTemplate({
+                title: "New extra writing request received",
+                bodyHtml:
+                    emailParagraph("A customer has paid for an extra writing request.") +
+                    emailDetails([
+                        { label: "Order", value: order?.razorpay_order_id || request.order_id },
+                        { label: "Customer", value: order?.name || "" },
+                        { label: "Email", value: order?.email || "" },
+                        { label: "Edition", value: order?.edition || "" },
+                        { label: "Word count", value: String(request.word_count) },
+                        { label: "Amount paid", value: `₹${request.amount}` },
+                        { label: "Request", value: nl2br(request.request_text), html: true },
+                    ]),
+            }),
+        })
+
+        return res.json({
+            success: true,
+            request: { ...request, payment_status: "paid", paid_at: now, razorpay_payment_id },
+        })
+    } catch (err) {
+        console.error("/story/confirm-extra-writing error:", safeErr(err))
+        return res.status(500).json({ error: "Extra writing payment confirmation failed" })
+    }
+})
+
 app.post("/story/create-addon-order", async (req, res) => {
   try {
     const { orderId, addonType, quantity = 1, customAmount, description, metadata } = req.body
@@ -3738,6 +3891,86 @@ app.post("/admin/login", adminAsync(async (req, res) => {
   return res.json({ success: true, adminToken: adminCreateToken(config.email) })
 }))
 
+app.get("/admin/extra-writing-requests", requireAdmin, adminAsync(async (req, res) => {
+    const { data: requests, error } = await supabase
+        .from("extra_writing_requests")
+        .select("*")
+        .eq("payment_status", "paid")
+        .order("created_at", { ascending: false })
+
+    if (error) return adminHandleSupabaseError(res, error, "Unable to load extra writing requests.")
+
+    if (!requests || requests.length === 0) {
+        return res.json({ success: true, requests: [] })
+    }
+
+    const orderIds = [...new Set(requests.map((r) => r.order_id))]
+    const { data: orders } = await supabase
+        .from("orders")
+        .select("id, razorpay_order_id, edition, name, email, phone")
+        .in("id", orderIds)
+
+    const orderMap = {}
+    for (const order of orders || []) {
+        orderMap[order.id] = order
+    }
+
+    const enriched = requests.map((r) => ({
+        ...r,
+        order: orderMap[r.order_id] || null,
+    }))
+
+    return res.json({ success: true, requests: enriched })
+}))
+
+app.patch("/admin/extra-writing-requests/:id", requireAdmin, adminAsync(async (req, res) => {
+    const id = adminRequireUuid(req.params.id, "extra writing request id")
+    const updates = {}
+
+    if (req.body.status !== undefined) {
+        const allowed = ["pending", "in_progress", "completed", "cancelled"]
+        if (!allowed.includes(req.body.status)) {
+            return adminJsonError(res, 400, "Invalid status")
+        }
+        updates.status = req.body.status
+    }
+
+    if (req.body.writer_name !== undefined) {
+        updates.writer_name = req.body.writer_name ? String(req.body.writer_name).trim().slice(0, 180) : null
+    }
+
+    if (req.body.writer_payout !== undefined) {
+        const payout = Number(req.body.writer_payout)
+        if (!Number.isFinite(payout) || payout < 0) {
+            return adminJsonError(res, 400, "Invalid writer_payout")
+        }
+        updates.writer_payout = payout
+    }
+
+    if (req.body.payout_paid !== undefined) {
+        updates.payout_paid = Boolean(req.body.payout_paid)
+        updates.payout_paid_at = req.body.payout_paid ? new Date().toISOString() : null
+    }
+
+    if (Object.keys(updates).length === 0) {
+        return adminJsonError(res, 400, "No allowed fields provided")
+    }
+
+    const { data, error } = await supabase
+        .from("extra_writing_requests")
+        .update(updates)
+        .eq("id", id)
+        .select("*")
+        .single()
+
+    if (error) {
+        if (error.code === "PGRST116") return adminJsonError(res, 404, "Request not found.")
+        return adminHandleSupabaseError(res, error, "Unable to update extra writing request.")
+    }
+
+    return res.json({ success: true, request: data })
+}))
+
 app.get("/admin/me", requireAdmin, adminAsync(async (req, res) => {
   return res.json({ success: true, admin: { email: req.admin.email } })
 }))
@@ -5309,4 +5542,5 @@ app.listen(PORT, () => {
   console.log(`✅ PRINT/SHIPMENT/PAYOUT/REVIEW-CHAT/REVENUE = Enabled`)
   console.log(`✅ PHASE 1 DOWNLOADS = story.txt, voice-notes.zip, cover-material.zip`)
   console.log(`✅ PHASE 2 = Balance gate, cart payments, review chat, white labeling`)
+  console.log(`✅ PHASE 3 = Extra writing flow + Delhivery (incoming)`)
 })
