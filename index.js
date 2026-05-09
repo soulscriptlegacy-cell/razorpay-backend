@@ -1,5 +1,3 @@
-
-
 // index.js (SoulScript Legacy backend)
 // Checkout upgraded:
 // - Backend calculates prices safely
@@ -14,6 +12,9 @@
 // - Private Supabase Storage files are served through signed URLs
 // - Chandan manager route added with safe operational data only
 // - Review files can be uploaded directly from admin panel
+// - Print submission, shipment, payout, review chat, revenue summary admin routes added
+// - Legacy upload route alias added
+// - Admin CORS now allows *.vercel.app preview deployments
 
 const express = require("express")
 const Razorpay = require("razorpay")
@@ -27,7 +28,7 @@ const app = express()
 
 const upload = multer({
   storage: multer.memoryStorage(),
-limits: { fileSize: 50 * 1024 * 1024 },
+  limits: { fileSize: 50 * 1024 * 1024 },
 })
 
 /* =========================
@@ -523,20 +524,20 @@ async function withSignedStoryIntake(intake) {
     intake.photo_path
   )
 
-const coverPhotoUrl = await createSignedUrlWithFallback(
-  [STORAGE_BUCKETS.reviewMedia, STORAGE_BUCKETS.coverPhotos, STORAGE_BUCKETS.coverReferences],
-  coverPhotoPath
-)
+  const coverPhotoUrl = await createSignedUrlWithFallback(
+    [STORAGE_BUCKETS.reviewMedia, STORAGE_BUCKETS.coverPhotos, STORAGE_BUCKETS.coverReferences],
+    coverPhotoPath
+  )
 
   const referencePaths = normalizeStoragePathArray(intake.reference_image_paths, 20)
   const referenceImages = await Promise.all(
     referencePaths.map(async (path) => ({
       file_path: path,
       path,
- signed_url: await createSignedUrlWithFallback(
-  [STORAGE_BUCKETS.reviewMedia, STORAGE_BUCKETS.coverReferences, STORAGE_BUCKETS.coverPhotos],
-  path
-),
+      signed_url: await createSignedUrlWithFallback(
+        [STORAGE_BUCKETS.reviewMedia, STORAGE_BUCKETS.coverReferences, STORAGE_BUCKETS.coverPhotos],
+        path
+      ),
     }))
   )
 
@@ -557,7 +558,7 @@ const coverPhotoUrl = await createSignedUrlWithFallback(
 async function withSignedCoverReferenceImages(images = []) {
   return Promise.all(
     (images || []).map(async (image) => {
-      const imagePath = firstNonEmpty(image.file_path, image.path)
+      const imagePath = image.file_path || image.path
 
       const signedUrl = await createSignedUrlWithFallback(
         [
@@ -2725,10 +2726,22 @@ class AdminInputError extends Error {
   }
 }
 
+function isAllowedAdminOrigin(origin) {
+  if (!origin) return false
+  if (ADMIN_ALLOWED_ORIGINS.has(origin)) return true
+
+  try {
+    const url = new URL(origin)
+    return url.hostname.endsWith(".vercel.app")
+  } catch {
+    return false
+  }
+}
+
 app.use("/admin", (req, res, next) => {
   const origin = req.headers.origin
 
-  if (origin && ADMIN_ALLOWED_ORIGINS.has(origin)) {
+  if (isAllowedAdminOrigin(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin)
     res.setHeader("Vary", "Origin")
   }
@@ -2919,6 +2932,22 @@ const ADMIN_ORDER_LIST_FIELDS = [
   "latest_review_file_id",
   "custom_cover_paid",
   "voice_note_addon_paid",
+  "print_submission_status",
+  "print_submission_completed_at",
+  "submitted_to_printer",
+  "print_order_number",
+  "shipment_status",
+  "pincode",
+  "tracking_number",
+  "awb_number",
+  "shipping_label_path",
+  "shipping_label_url",
+  "payout_paid",
+  "payout_paid_at",
+  "manager_name",
+  "writer_name",
+  "manager_payout",
+  "writer_payout",
 ].join(",")
 
 const ADMIN_ORDER_DETAIL_FIELDS = ADMIN_ORDER_LIST_FIELDS
@@ -2945,6 +2974,16 @@ const MANAGER_ORDER_FIELDS = [
   "latest_review_file_id",
   "custom_cover_paid",
   "voice_note_addon_paid",
+  "print_submission_status",
+  "print_submission_completed_at",
+  "submitted_to_printer",
+  "print_order_number",
+  "shipment_status",
+  "pincode",
+  "tracking_number",
+  "awb_number",
+  "shipping_label_path",
+  "shipping_label_url",
 ].join(",")
 
 app.post("/admin/login", adminAsync(async (req, res) => {
@@ -3330,6 +3369,8 @@ app.post("/admin/orders/:id/send-story-reminder", requireAdmin, adminAsync(async
       message: "Reminder email could not be sent.",
       error: sent.error,
       portalUrl,
+      order_id: order.id,
+      razorpay_order_id: order.razorpay_order_id,
     })
   }
 
@@ -3338,10 +3379,15 @@ app.post("/admin/orders/:id/send-story-reminder", requireAdmin, adminAsync(async
     message: "Story reminder email sent.",
     to: customerEmail,
     portalUrl,
+    order_id: order.id,
+    razorpay_order_id: order.razorpay_order_id,
   })
 }))
 
-app.post("/admin/orders/:id/upload-review-files", requireAdmin, adminUploadReviewFiles, adminAsync(async (req, res) => {
+/* =========================
+   ADMIN: UPLOAD REVIEW FILES (with legacy alias)
+========================= */
+async function handleAdminUploadReviewFiles(req, res) {
   const id = adminRequireUuid(req.params.id, "order id")
 
   const manuscriptFile = uploadedFile(req, ["manuscript_pdf", "manuscriptPdf", "pdf"])
@@ -3462,7 +3508,22 @@ app.post("/admin/orders/:id/upload-review-files", requireAdmin, adminUploadRevie
       cover_file_url: signedReviewFile?.cover_file_signed_url || null,
     },
   })
-}))
+}
+
+app.post(
+  "/admin/orders/:id/upload-review-files",
+  requireAdmin,
+  adminUploadReviewFiles,
+  adminAsync(handleAdminUploadReviewFiles)
+)
+
+// Legacy alias - some older admin clients still POST to the singular path.
+app.post(
+  "/admin/orders/:id/upload-review-file",
+  requireAdmin,
+  adminUploadReviewFiles,
+  adminAsync(handleAdminUploadReviewFiles)
+)
 
 app.patch("/admin/orders/:id", requireAdmin, adminAsync(async (req, res) => {
   const id = adminRequireUuid(req.params.id, "order id")
@@ -3494,6 +3555,371 @@ app.patch("/admin/orders/:id", requireAdmin, adminAsync(async (req, res) => {
   }
 
   return res.json({ success: true, order: data })
+}))
+
+/* =========================
+   ADMIN: PRINT SUBMISSION
+========================= */
+app.patch("/admin/orders/:id/print-submission", requireAdmin, adminAsync(async (req, res) => {
+  const id = adminRequireUuid(req.params.id, "order id")
+
+  const printSubmissionStatus = adminBoolean(req.body?.print_submission_status, "print_submission_status")
+  const submittedToPrinter = adminBoolean(req.body?.submitted_to_printer, "submitted_to_printer")
+
+  if (printSubmissionStatus === undefined && submittedToPrinter === undefined) {
+    return adminJsonError(res, 400, "Provide print_submission_status or submitted_to_printer.")
+  }
+
+  const updates = {}
+
+  // If either flag is true, treat as "submitted"
+  const markingSubmitted = printSubmissionStatus === true || submittedToPrinter === true
+  // If either flag is explicitly false, treat as "un-submit"
+  const markingUnsubmitted =
+    !markingSubmitted &&
+    (printSubmissionStatus === false || submittedToPrinter === false)
+
+  if (markingSubmitted) {
+    updates.print_submission_status = true
+    updates.submitted_to_printer = true
+    updates.print_submission_completed_at = new Date().toISOString()
+  } else if (markingUnsubmitted) {
+    if (printSubmissionStatus === false) updates.print_submission_status = false
+    if (submittedToPrinter === false) updates.submitted_to_printer = false
+    updates.print_submission_completed_at = null
+  }
+
+  const { data, error } = await supabase
+    .from("orders")
+    .update(updates)
+    .eq("id", id)
+    .select(ADMIN_ORDER_DETAIL_FIELDS)
+    .single()
+
+  if (error) {
+    if (error.code === "PGRST116") return adminJsonError(res, 404, "Order not found.")
+    return adminHandleSupabaseError(res, error, "Unable to update print submission.")
+  }
+
+  return res.json({ success: true, order: data })
+}))
+
+/* =========================
+   ADMIN: SHIPMENT
+========================= */
+const ALLOWED_SHIPMENT_STATUSES = new Set([
+  "under_printing",
+  "in_transit",
+  "delivered",
+  "shipped",
+  "pending",
+])
+
+app.patch("/admin/orders/:id/shipment", requireAdmin, adminAsync(async (req, res) => {
+  const id = adminRequireUuid(req.params.id, "order id")
+  const updates = {}
+
+  if (adminHasOwn(req.body, "print_order_number")) {
+    updates.print_order_number = adminStringOrNull(req.body.print_order_number, "print_order_number", 120)
+  }
+
+  if (adminHasOwn(req.body, "shipment_status")) {
+    const value = req.body.shipment_status
+    if (value === null || value === "") {
+      updates.shipment_status = null
+    } else {
+      const cleaned = adminStringOrNull(value, "shipment_status", 60)
+      if (cleaned !== null && !ALLOWED_SHIPMENT_STATUSES.has(cleaned)) {
+        return adminJsonError(res, 400, "Invalid shipment_status.")
+      }
+      updates.shipment_status = cleaned
+    }
+  }
+
+  if (adminHasOwn(req.body, "address")) {
+    updates.address = adminStringOrNull(req.body.address, "address", 2500)
+  }
+
+  if (adminHasOwn(req.body, "pincode")) {
+    updates.pincode = adminStringOrNull(req.body.pincode, "pincode", 20)
+  }
+
+  if (adminHasOwn(req.body, "tracking_number")) {
+    updates.tracking_number = adminStringOrNull(req.body.tracking_number, "tracking_number", 160)
+  }
+
+  if (adminHasOwn(req.body, "awb_number")) {
+    updates.awb_number = adminStringOrNull(req.body.awb_number, "awb_number", 160)
+  }
+
+  if (adminHasOwn(req.body, "shipping_label_path")) {
+    updates.shipping_label_path = adminStringOrNull(req.body.shipping_label_path, "shipping_label_path", 1200)
+  }
+
+  if (adminHasOwn(req.body, "shipping_label_url")) {
+    updates.shipping_label_url = adminStringOrNull(req.body.shipping_label_url, "shipping_label_url", 2000)
+  }
+
+  if (Object.keys(updates).length === 0) {
+    return adminJsonError(res, 400, "No allowed shipment fields provided.")
+  }
+
+  // Light status sync based on shipment_status, if it was provided.
+  if (adminHasOwn(req.body, "shipment_status")) {
+    const status = updates.shipment_status
+    if (status === "under_printing") {
+      updates.production_status = "under_printing"
+      updates.order_status = "under_printing"
+    } else if (status === "in_transit" || status === "shipped") {
+      updates.production_status = "in_transit"
+      updates.order_status = "in_transit"
+    } else if (status === "delivered") {
+      updates.production_status = "delivered"
+      updates.order_status = "delivered"
+    }
+  }
+
+  const { data, error } = await supabase
+    .from("orders")
+    .update(updates)
+    .eq("id", id)
+    .select(ADMIN_ORDER_DETAIL_FIELDS)
+    .single()
+
+  if (error) {
+    if (error.code === "PGRST116") return adminJsonError(res, 404, "Order not found.")
+    return adminHandleSupabaseError(res, error, "Unable to update shipment.")
+  }
+
+  // Best-effort: if delivered, stamp deliverables.delivered_at. Don't fail the route if column missing.
+  if (updates.shipment_status === "delivered") {
+    try {
+      await supabase
+        .from("deliverables")
+        .update({ delivered_at: new Date().toISOString() })
+        .eq("order_id", id)
+        .is("delivered_at", null)
+    } catch (deliverableErr) {
+      console.warn("⚠️ Could not stamp deliverables.delivered_at:", safeErr(deliverableErr))
+    }
+  }
+
+  return res.json({ success: true, order: data })
+}))
+
+/* =========================
+   ADMIN: PAYOUT
+========================= */
+app.patch("/admin/orders/:id/payout", requireAdmin, adminAsync(async (req, res) => {
+  const id = adminRequireUuid(req.params.id, "order id")
+  const updates = {}
+
+  if (adminHasOwn(req.body, "payout_paid")) {
+    const payoutPaid = adminBoolean(req.body.payout_paid, "payout_paid")
+    if (payoutPaid !== undefined) {
+      updates.payout_paid = payoutPaid
+      updates.payout_paid_at = payoutPaid ? new Date().toISOString() : null
+    }
+  }
+
+  if (adminHasOwn(req.body, "manager_name")) {
+    updates.manager_name = adminStringOrNull(req.body.manager_name, "manager_name", 180)
+  }
+
+  if (adminHasOwn(req.body, "writer_name")) {
+    updates.writer_name = adminStringOrNull(req.body.writer_name, "writer_name", 180)
+  }
+
+  if (adminHasOwn(req.body, "manager_payout")) {
+    updates.manager_payout = adminNumberOrNull(req.body.manager_payout, "manager_payout")
+  }
+
+  if (adminHasOwn(req.body, "writer_payout")) {
+    updates.writer_payout = adminNumberOrNull(req.body.writer_payout, "writer_payout")
+  }
+
+  if (Object.keys(updates).length === 0) {
+    return adminJsonError(res, 400, "No allowed payout fields provided.")
+  }
+
+  const { data, error } = await supabase
+    .from("orders")
+    .update(updates)
+    .eq("id", id)
+    .select(ADMIN_ORDER_DETAIL_FIELDS)
+    .single()
+
+  if (error) {
+    if (error.code === "PGRST116") return adminJsonError(res, 404, "Order not found.")
+    return adminHandleSupabaseError(res, error, "Unable to update payout.")
+  }
+
+  return res.json({ success: true, order: data })
+}))
+
+/* =========================
+   ADMIN: REVIEW CHAT (revision_messages)
+========================= */
+const ALLOWED_REVISION_MESSAGE_SENDERS = new Set(["admin", "customer", "system"])
+
+app.get("/admin/revisions/:id/messages", requireAdmin, adminAsync(async (req, res) => {
+  const id = adminRequireUuid(req.params.id, "revision id")
+
+  const { data: revision, error: revisionErr } = await supabase
+    .from("revisions")
+    .select("id, order_id")
+    .eq("id", id)
+    .single()
+
+  if (revisionErr || !revision) {
+    if (revisionErr?.code === "PGRST116") return adminJsonError(res, 404, "Revision not found.")
+    return adminHandleSupabaseError(res, revisionErr, "Unable to load revision.")
+  }
+
+  const { data: messages, error: messagesErr } = await supabase
+    .from("revision_messages")
+    .select("*")
+    .eq("revision_id", id)
+    .order("created_at", { ascending: true })
+
+  if (messagesErr) return adminHandleSupabaseError(res, messagesErr, "Unable to load revision messages.")
+
+  return res.json({ success: true, messages: messages || [] })
+}))
+
+app.post("/admin/revisions/:id/messages", requireAdmin, adminAsync(async (req, res) => {
+  const id = adminRequireUuid(req.params.id, "revision id")
+
+  const senderTypeRaw = req.body?.sender_type
+  let senderType = "admin"
+  if (senderTypeRaw !== undefined && senderTypeRaw !== null && senderTypeRaw !== "") {
+    if (typeof senderTypeRaw !== "string") return adminJsonError(res, 400, "sender_type must be a string.")
+    if (!ALLOWED_REVISION_MESSAGE_SENDERS.has(senderTypeRaw)) {
+      return adminJsonError(res, 400, "Invalid sender_type.")
+    }
+    senderType = senderTypeRaw
+  }
+
+  const message = adminStringOrNull(req.body?.message, "message", 6000)
+  if (!message) return adminJsonError(res, 400, "message is required.")
+
+  let attachments = []
+  if (adminHasOwn(req.body, "attachments")) {
+    if (req.body.attachments === null || req.body.attachments === undefined) {
+      attachments = []
+    } else if (Array.isArray(req.body.attachments)) {
+      attachments = req.body.attachments
+    } else {
+      return adminJsonError(res, 400, "attachments must be an array.")
+    }
+  }
+
+  const { data: revision, error: revisionErr } = await supabase
+    .from("revisions")
+    .select("id, order_id")
+    .eq("id", id)
+    .single()
+
+  if (revisionErr || !revision) {
+    if (revisionErr?.code === "PGRST116") return adminJsonError(res, 404, "Revision not found.")
+    return adminHandleSupabaseError(res, revisionErr, "Unable to load revision.")
+  }
+
+  const { data: inserted, error: insertErr } = await supabase
+    .from("revision_messages")
+    .insert({
+      revision_id: revision.id,
+      order_id: revision.order_id,
+      sender_type: senderType,
+      message,
+      attachments,
+    })
+    .select("*")
+    .single()
+
+  if (insertErr || !inserted) {
+    return adminHandleSupabaseError(res, insertErr, "Unable to send message.")
+  }
+
+  return res.json({ success: true, message: inserted })
+}))
+
+/* =========================
+   ADMIN: REVENUE
+========================= */
+app.get("/admin/revenue", requireAdmin, adminAsync(async (req, res) => {
+  const [ordersResult, addonsResult] = await Promise.all([
+    supabase
+      .from("orders")
+      .select(ADMIN_ORDER_LIST_FIELDS)
+      .order("created_at", { ascending: false }),
+    supabase.from("order_addons").select("*"),
+  ])
+
+  if (ordersResult.error) return adminHandleSupabaseError(res, ordersResult.error, "Unable to load revenue orders.")
+  if (addonsResult.error) return adminHandleSupabaseError(res, addonsResult.error, "Unable to load revenue add-ons.")
+
+  const orders = ordersResult.data || []
+  const addons = addonsResult.data || []
+
+  const now = new Date()
+  const currentYear = now.getUTCFullYear()
+  const currentMonth = now.getUTCMonth()
+
+  let totalCollected = 0
+  let thisMonthCollected = 0
+  let totalPendingBalance = 0
+  let totalOrders = 0
+  let prepaidOrders = 0
+  let advanceOrders = 0
+  let totalOrderValueSum = 0
+
+  for (const order of orders) {
+    totalOrders += 1
+
+    const paid = Number(order.paid_amount || order.amount || 0)
+    const safePaid = Number.isFinite(paid) ? paid : 0
+    totalCollected += safePaid
+
+    if (order.created_at) {
+      const created = new Date(order.created_at)
+      if (
+        !Number.isNaN(created.getTime()) &&
+        created.getUTCFullYear() === currentYear &&
+        created.getUTCMonth() === currentMonth
+      ) {
+        thisMonthCollected += safePaid
+      }
+    }
+
+    const pending = Number(order.balance_due || order.pending_amount || 0)
+    if (Number.isFinite(pending)) totalPendingBalance += pending
+
+    const orderValue = Number(order.total_order_value || order.amount || 0)
+    if (Number.isFinite(orderValue)) totalOrderValueSum += orderValue
+
+    if (order.payment_type === "PREPAID") prepaidOrders += 1
+    else if (order.payment_type === "ADVANCE") advanceOrders += 1
+  }
+
+  const addonRevenue = addons
+    .filter(addonIsPaid)
+    .reduce((sum, addon) => sum + addonAmount(addon), 0)
+
+  return res.json({
+    success: true,
+    summary: {
+      total_collected: totalCollected,
+      this_month_collected: thisMonthCollected,
+      total_pending_balance: totalPendingBalance,
+      total_orders: totalOrders,
+      prepaid_orders: prepaidOrders,
+      advance_orders: advanceOrders,
+      addon_revenue: addonRevenue,
+      total_order_value: totalOrderValueSum,
+    },
+    orders,
+  })
 }))
 
 app.get("/admin/story-intakes", requireAdmin, adminAsync(async (req, res) => {
@@ -3675,4 +4101,5 @@ app.listen(PORT, () => {
   console.log(`✅ ADMIN API       = Enabled`)
   console.log(`✅ STORY API       = Enabled`)
   console.log(`✅ STORAGE API     = Signed URLs enabled`)
+  console.log(`✅ PRINT/SHIPMENT/PAYOUT/REVIEW-CHAT/REVENUE = Enabled`)
 })
