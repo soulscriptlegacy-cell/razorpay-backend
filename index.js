@@ -42,6 +42,14 @@ const REVIEW_NOTIFICATION_EMAIL = process.env.REVIEW_NOTIFICATION_EMAIL || "chan
 const DELHIVERY_API_TOKEN = process.env.DELHIVERY_API_TOKEN || ""
 const DELHIVERY_BASE_URL = process.env.DELHIVERY_BASE_URL || "https://track.delhivery.com"
 const DELHIVERY_PICKUP_NAME = process.env.DELHIVERY_PICKUP_NAME || ""
+const DELHIVERY_SELLER_NAME = process.env.DELHIVERY_SELLER_NAME || "SoulScript Legacy"
+const DELHIVERY_SELLER_ADDRESS = process.env.DELHIVERY_SELLER_ADDRESS || "SoulScript Legacy"
+const DELHIVERY_SELLER_PHONE = process.env.DELHIVERY_SELLER_PHONE || ""
+const DELHIVERY_RETURN_ADDRESS = process.env.DELHIVERY_RETURN_ADDRESS || ""
+const DELHIVERY_RETURN_PIN = process.env.DELHIVERY_RETURN_PIN || ""
+const DELHIVERY_RETURN_CITY = process.env.DELHIVERY_RETURN_CITY || ""
+const DELHIVERY_RETURN_STATE = process.env.DELHIVERY_RETURN_STATE || ""
+const DELHIVERY_RETURN_PHONE = process.env.DELHIVERY_RETURN_PHONE || DELHIVERY_SELLER_PHONE
 
 const CHAT_IMAGE_MAX_PER_MESSAGE = 10
 const CHAT_IMAGE_MAX_SIZE_BYTES = 5 * 1024 * 1024 // 5 MB
@@ -482,11 +490,18 @@ async function delhiveryRequest(path, options = {}) {
     return body
 }
 
+function cleanDelhiveryText(value, maxLength = 250) {
+    return String(value || "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, maxLength)
+}
+
 function buildDelhiveryShipmentPayload(order) {
-    const customerName = String(order.name || "Customer").trim()
+    const customerName = cleanDelhiveryText(order.name || "Customer", 90)
     const phone = String(order.phone || "").replace(/\D/g, "").slice(-10)
     const pincode = String(order.pincode || "").replace(/\D/g, "")
-    const address = String(order.address || "").slice(0, 250)
+    const baseAddress = cleanDelhiveryText(order.address, 180)
 
     if (!pincode || pincode.length !== 6) {
         throw new Error("Order pincode is missing or invalid")
@@ -494,6 +509,18 @@ function buildDelhiveryShipmentPayload(order) {
     if (!phone || phone.length !== 10) {
         throw new Error("Order phone is missing or invalid")
     }
+    if (!baseAddress) {
+        throw new Error("Order address is missing")
+    }
+
+    const address = cleanDelhiveryText(
+        `${baseAddress}, Phone: ${phone}, PIN: ${pincode}`,
+        250
+    )
+    const sellerAddress = cleanDelhiveryText(DELHIVERY_SELLER_ADDRESS, 180)
+    const returnAddress = cleanDelhiveryText(DELHIVERY_RETURN_ADDRESS, 180)
+    const returnPhone = String(DELHIVERY_RETURN_PHONE || "").replace(/\D/g, "").slice(-10)
+    const returnPin = String(DELHIVERY_RETURN_PIN || "").replace(/\D/g, "")
 
     return {
         shipments: [
@@ -505,19 +532,19 @@ function buildDelhiveryShipmentPayload(order) {
                 phone: phone,
                 order: order.razorpay_order_id || order.id,
                 payment_mode: "Prepaid",
-                return_pin: "",
-                return_city: "",
-                return_phone: "",
-                return_add: "",
-                return_state: "",
-                return_country: "",
+                return_pin: returnPin,
+                return_city: cleanDelhiveryText(DELHIVERY_RETURN_CITY, 80),
+                return_phone: returnPhone,
+                return_add: returnAddress,
+                return_state: cleanDelhiveryText(DELHIVERY_RETURN_STATE, 80),
+                return_country: returnAddress ? "India" : "",
                 products_desc: "Personalized printed novel",
                 hsn_code: "",
                 cod_amount: "",
                 order_date: null,
                 total_amount: String(order.total_order_value || order.amount || 0),
-                seller_add: "",
-                seller_name: "SoulScript Legacy",
+                seller_add: sellerAddress,
+                seller_name: cleanDelhiveryText(DELHIVERY_SELLER_NAME, 90),
                 seller_inv: "",
                 quantity: "1",
                 waybill: "",
