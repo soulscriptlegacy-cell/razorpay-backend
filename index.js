@@ -25,6 +25,8 @@ const { Readable } = require("stream")
 const cors = require("cors")
 const multer = require("multer")
 const archiver = require("archiver")
+const PDFDocument = require("pdfkit")
+const bwipjs = require("bwip-js")
 const { Resend } = require("resend")
 const { createClient } = require("@supabase/supabase-js")
 
@@ -5865,87 +5867,276 @@ app.post("/admin/orders/:id/delhivery-create-shipment", requireAdmin, adminAsync
 }))
 
 app.get("/admin/orders/:id/delhivery-label", requireAdmin, adminAsync(async (req, res) => {
-    const id = adminRequireUuid(req.params.id, "order id")
-
-    const { data: order, error: orderErr } = await supabase
-        .from("orders")
-        .select("id, awb_number, tracking_number")
-        .eq("id", id)
-        .single()
-
-    if (orderErr || !order) {
-        if (orderErr?.code === "PGRST116") return adminJsonError(res, 404, "Order not found.")
-        return adminHandleSupabaseError(res, orderErr, "Unable to load order.")
-    }
-
-    const awb = order.awb_number || order.tracking_number
-    if (!awb) {
-        return adminJsonError(res, 400, "No AWB number on this order")
-    }
-
-    if (!DELHIVERY_API_TOKEN) {
-        return adminJsonError(res, 500, "Delhivery is not configured")
-    }
-
     try {
-        const url = `${DELHIVERY_BASE_URL}/api/p/packing_slip?wbns=${encodeURIComponent(awb)}&pdf=true`
-        const response = await fetch(url, {
+        const id = adminRequireUuid(req.params.id, "order id")
+
+        const { data: order, error: orderErr } = await supabase
+            .from("orders")
+            .select("id, razorpay_order_id, name, phone, address, pincode, edition, total_order_value, amount, awb_number, tracking_number")
+            .eq("id", id)
+            .single()
+
+        if (orderErr || !order) {
+            if (orderErr?.code === "PGRST116") return adminJsonError(res, 404, "Order not found.")
+            return adminHandleSupabaseError(res, orderErr, "Unable to load order.")
+        }
+
+        const awb = order.awb_number || order.tracking_number
+        if (!awb) {
+            return adminJsonError(res, 400, "No AWB number on this order")
+        }
+
+        if (!DELHIVERY_API_TOKEN) {
+            return adminJsonError(res, 500, "Delhivery is not configured")
+        }
+
+        const jsonUrl = `${DELHIVERY_BASE_URL}/api/p/packing_slip?wbns=${encodeURIComponent(awb)}&verbose=true`
+        const response = await fetch(jsonUrl, {
             method: "GET",
             headers: {
                 "Authorization": `Token ${DELHIVERY_API_TOKEN}`,
-               
+                "Accept": "application/json",
             },
         })
 
         if (!response.ok) {
             const errorText = await response.text().catch(() => "")
-            console.error("Delhivery label fetch failed:", {
+            console.error("Delhivery label metadata fetch failed:", {
                 status: response.status,
                 error: errorText.slice(0, 500),
             })
-            return adminJsonError(res, 502, "Could not fetch Delhivery label")
         }
 
-        const contentType = response.headers.get("content-type") || ""
-        let pdfResponse = response
+        const labelPayload = response.ok ? await response.json().catch(() => null) : null
+        const firstPackage =
+            (Array.isArray(labelPayload?.packages) && labelPayload.packages[0]) ||
+            (Array.isArray(labelPayload?.shipment_data) && labelPayload.shipment_data[0]) ||
+            (Array.isArray(labelPayload?.ShipmentData) && labelPayload.ShipmentData[0]) ||
+            null
+        const shipmentInfo = firstPackage?.shipment || firstPackage?.Shipment || firstPackage || {}
+        const destinationPin = String(
+            shipmentInfo?.pin ||
+            shipmentInfo?.pincode ||
+            shipmentInfo?.consignee_pin ||
+            shipmentInfo?.destination_pin ||
+            order.pincode ||
+            ""
+        )
+        const sortCode = String(
+            shipmentInfo?.sort_code ||
+            shipmentInfo?.sortcode ||
+            shipmentInfo?.destination_sort_code ||
+            shipmentInfo?.routing_code ||
+            shipmentInfo?.route ||
+            destinationPin ||
+            ""
+        )
+        const pickupDetails =
+            shipmentInfo?.pickup ||
+            shipmentInfo?.pickup_location ||
+            shipmentInfo?.pickup_details ||
+            labelPayload?.pickup ||
+            null
 
-        if (contentType.includes("application/json")) {
-            const labelPayload = await response.json().catch(() => null)
-            const pdfUrl =
-                labelPayload?.packages?.[0]?.pdf_download_link ||
-                labelPayload?.pdf_download_link ||
-                labelPayload?.download_link ||
-                null
+        const barcodeBuffer = await bwipjs.toBuffer({
+            bcid: "code128",
+            text: awb,
+            scale: 3,
+            height: 18,
+            includetext: false,
+            backgroundcolor: "FFFFFF",
+        })
 
-            if (!pdfUrl) {
-                console.error("Delhivery label response missing pdf_download_link:", labelPayload)
-                return adminJsonError(res, 502, "Delhivery did not return a PDF label link")
-            }
+        const orderReference = order.razorpay_order_id || order.id
+        const orderBarcodeBuffer = await bwipjs.toBuffer({
+            bcid: "code128",
+            text: orderReference,
+            scale: 2,
+            height: 12,
+            includetext: false,
+            backgroundcolor: "FFFFFF",
+        })
 
-            pdfResponse = await fetch(pdfUrl, { method: "GET" })
-
-            if (!pdfResponse.ok) {
-                const errorText = await pdfResponse.text().catch(() => "")
-                console.error("Delhivery label PDF link failed:", {
-                    status: pdfResponse.status,
-                    error: errorText.slice(0, 500),
+        const formatAmount = (value) => {
+            const amount = Number(value || 0)
+            if (!Number.isFinite(amount)) return "₹0"
+            return `₹${Math.round(amount).toLocaleString("en-IN")}`
+        }
+        const formatDate = (value = new Date()) =>
+            new Intl.DateTimeFormat("en-IN", {
+                day: "2-digit",
+                month: "long",
+                year: "numeric",
+            }).format(value)
+        const cleanText = (value, maxLength = 500) =>
+            String(value || "")
+                .replace(/\s+/g, " ")
+                .trim()
+                .slice(0, maxLength)
+        const drawRule = (doc, y, color = "#D9D2C5") => {
+            doc.save()
+                .lineWidth(0.25)
+                .strokeColor(color)
+                .moveTo(14, y)
+                .lineTo(274, y)
+                .stroke()
+                .restore()
+        }
+        const labelText = (doc, text, x, y, options = {}) => {
+            doc.font("Helvetica")
+                .fontSize(5)
+                .fillColor("#8B8680")
+                .text(text, x, y, {
+                    characterSpacing: 2,
+                    lineBreak: false,
+                    ...options,
                 })
-                return adminJsonError(res, 502, "Could not download Delhivery PDF label")
-            }
         }
+
+        const totalValue = order.total_order_value || order.amount || 0
+        const customerName = cleanText(order.name || "Customer", 90)
+        const phone = String(order.phone || "").replace(/\D/g, "").slice(-10)
+        const address = cleanText(order.address, 260)
+        const pincode = cleanText(destinationPin || order.pincode, 12)
+        const edition = cleanText(order.edition || "SoulScript Legacy novel", 120)
+        const returnAddress = cleanText(
+            "Tatibandh, Kabir Nagar, Near Tiranga Chowk / Siddhi Vinayak Chowk, Shivalay Shiv Mandir MIG 101 (M2), Raipur, Chhattisgarh, India",
+            260
+        )
+        const originAddress = "Tatibandh, Kabir Nagar Colony, Face 2, M-2, Near Tiranga Chowk, Behind Shivalay, Shiv Mandir MIG 101 (M2), Raipur, Chhattisgarh, India"
+
+        const doc = new PDFDocument({
+            size: [288, 432],
+            margin: 10,
+            layout: "portrait",
+        })
 
         res.setHeader("Content-Type", "application/pdf")
         res.setHeader("Content-Disposition", `attachment; filename="SoulScript-label-${awb}.pdf"`)
+        doc.pipe(res)
 
-        if (pdfResponse.body && typeof Readable.fromWeb === "function") {
-            return Readable.fromWeb(pdfResponse.body).pipe(res)
-        }
+        doc.rect(0, 0, 288, 432).fill("#FAF7F1")
 
-        const arrayBuffer = await pdfResponse.arrayBuffer()
-        return res.send(Buffer.from(arrayBuffer))
+        doc.font("Helvetica-Bold")
+            .fontSize(9)
+            .fillColor("#0E0E0E")
+            .text("SOULSCRIPT", 14, 18, { characterSpacing: 3, lineBreak: false })
+        doc.font("Helvetica")
+            .fontSize(5.5)
+            .fillColor("#8B8680")
+            .text("LEGACY", 14, 30, { characterSpacing: 3, lineBreak: false })
+        doc.font("Helvetica")
+            .fontSize(5.5)
+            .fillColor("#8B8680")
+            .text("EST. MMXXV", 190, 18, {
+                width: 84,
+                align: "right",
+                characterSpacing: 2,
+                lineBreak: false,
+            })
+        drawRule(doc, 46)
+
+        labelText(doc, "TRACKING", 14, 56)
+        doc.font("Helvetica")
+            .fontSize(7.5)
+            .fillColor("#0E0E0E")
+            .text(awb, 14, 64, { lineBreak: false })
+        doc.font("Helvetica-Bold")
+            .fontSize(7.5)
+            .fillColor("#0E0E0E")
+            .text(sortCode, 190, 64, { width: 84, align: "right", lineBreak: false })
+
+        doc.image(barcodeBuffer, 14, 78, { width: 260, height: 40 })
+        drawRule(doc, 130)
+
+        labelText(doc, "SHIP TO", 14, 144)
+        doc.font("Helvetica-Bold")
+            .fontSize(11)
+            .fillColor("#0E0E0E")
+            .text(customerName, 14, 154, { width: 160, lineBreak: false })
+        doc.font("Helvetica")
+            .fontSize(7)
+            .fillColor("#0E0E0E")
+            .text(address, 14, 170, { width: 160, lineGap: 2 })
+        const addressHeight = doc.heightOfString(address, { width: 160, lineGap: 2 })
+        const phoneY = Math.min(230, 170 + addressHeight + 6)
+        doc.font("Helvetica")
+            .fontSize(7)
+            .fillColor("#0E0E0E")
+            .text(`T  ${phone || "-"}`, 14, phoneY, { width: 160, lineBreak: false })
+        doc.font("Helvetica-Bold")
+            .fontSize(7)
+            .fillColor("#0E0E0E")
+            .text(`PIN  ${pincode || "-"}`, 14, phoneY + 12, { width: 160, lineBreak: false })
+
+        labelText(doc, "PAYMENT", 190, 144)
+        doc.font("Helvetica-Bold")
+            .fontSize(9)
+            .fillColor("#0E0E0E")
+            .text("Prepaid", 190, 154, { width: 84, lineBreak: false })
+        labelText(doc, "VALUE", 190, 170)
+        doc.font("Helvetica-Bold")
+            .fontSize(11)
+            .fillColor("#0E0E0E")
+            .text(formatAmount(totalValue), 190, 178, { width: 84, lineBreak: false })
+        labelText(doc, "DATE", 190, 200)
+        doc.font("Helvetica")
+            .fontSize(7)
+            .fillColor("#0E0E0E")
+            .text(formatDate(), 190, 208, { width: 84, lineBreak: false })
+        drawRule(doc, 260)
+
+        labelText(doc, "ORIGIN", 14, 272)
+        doc.font("Helvetica-Bold")
+            .fontSize(7)
+            .fillColor("#0E0E0E")
+            .text("SoulScript Legacy", 14, 280, { width: 260, lineBreak: false })
+        doc.font("Helvetica")
+            .fontSize(6)
+            .fillColor("#0E0E0E")
+            .text(originAddress, 14, 290, { width: 260, lineGap: 2 })
+
+        drawRule(doc, 315)
+        labelText(doc, "CONTENTS", 14, 323)
+        doc.font("Helvetica")
+            .fontSize(7.5)
+            .fillColor("#0E0E0E")
+            .text(edition, 14, 333, { width: 190, lineBreak: false })
+        doc.font("Helvetica")
+            .fontSize(7.5)
+            .fillColor("#0E0E0E")
+            .text("01 / 01", 220, 333, { width: 54, align: "right", lineBreak: false })
+        drawRule(doc, 348)
+
+        doc.image(orderBarcodeBuffer, 64, 358, { width: 160, height: 22 })
+        doc.font("Helvetica")
+            .fontSize(5.5)
+            .fillColor("#8B8680")
+            .text(`REF ${orderReference}`, 14, 384, {
+                width: 260,
+                align: "center",
+                characterSpacing: 1.5,
+                lineBreak: false,
+            })
+
+        drawRule(doc, 400, "#B8975A")
+        labelText(doc, "RETURN", 14, 408)
+        doc.font("Helvetica")
+            .fontSize(5.5)
+            .fillColor("#0E0E0E")
+            .text(returnAddress, 14, 416, { width: 200, lineGap: 1.5 })
+        doc.font("Helvetica")
+            .fontSize(5)
+            .fillColor("#8B8680")
+            .text("01 / 01", 220, 416, { width: 54, align: "right", lineBreak: false })
+
+        doc.end()
     } catch (err) {
-        console.error("Delhivery label download failed:", safeErr(err))
-        return adminJsonError(res, 502, err?.message || "Delhivery label download error")
+        console.error("Delhivery label generation failed:", safeErr(err))
+        if (!res.headersSent) {
+            return adminJsonError(res, 502, err?.message || "Delhivery label generation error")
+        }
+        return res.end()
     }
 }))
 
