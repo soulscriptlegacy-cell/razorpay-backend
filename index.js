@@ -5878,14 +5878,42 @@ app.get("/admin/orders/:id/delhivery-label", requireAdmin, adminAsync(async (req
             return adminJsonError(res, 502, "Could not fetch Delhivery label")
         }
 
+        const contentType = response.headers.get("content-type") || ""
+        let pdfResponse = response
+
+        if (contentType.includes("application/json")) {
+            const labelPayload = await response.json().catch(() => null)
+            const pdfUrl =
+                labelPayload?.packages?.[0]?.pdf_download_link ||
+                labelPayload?.pdf_download_link ||
+                labelPayload?.download_link ||
+                null
+
+            if (!pdfUrl) {
+                console.error("Delhivery label response missing pdf_download_link:", labelPayload)
+                return adminJsonError(res, 502, "Delhivery did not return a PDF label link")
+            }
+
+            pdfResponse = await fetch(pdfUrl, { method: "GET" })
+
+            if (!pdfResponse.ok) {
+                const errorText = await pdfResponse.text().catch(() => "")
+                console.error("Delhivery label PDF link failed:", {
+                    status: pdfResponse.status,
+                    error: errorText.slice(0, 500),
+                })
+                return adminJsonError(res, 502, "Could not download Delhivery PDF label")
+            }
+        }
+
         res.setHeader("Content-Type", "application/pdf")
         res.setHeader("Content-Disposition", `attachment; filename="SoulScript-label-${awb}.pdf"`)
 
-        if (response.body && typeof Readable.fromWeb === "function") {
-            return Readable.fromWeb(response.body).pipe(res)
+        if (pdfResponse.body && typeof Readable.fromWeb === "function") {
+            return Readable.fromWeb(pdfResponse.body).pipe(res)
         }
 
-        const arrayBuffer = await response.arrayBuffer()
+        const arrayBuffer = await pdfResponse.arrayBuffer()
         return res.send(Buffer.from(arrayBuffer))
     } catch (err) {
         console.error("Delhivery label download failed:", safeErr(err))
