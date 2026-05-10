@@ -22,6 +22,10 @@ const EXTRA_WRITING_PRICE_PER_WORD = 1
 
 const REVIEW_NOTIFICATION_EMAIL = process.env.REVIEW_NOTIFICATION_EMAIL || "chandan@soulscriptlegacy.com"
 
+const DELHIVERY_API_TOKEN = process.env.DELHIVERY_API_TOKEN || ""
+const DELHIVERY_BASE_URL = process.env.DELHIVERY_BASE_URL || "https://track.delhivery.com"
+const DELHIVERY_PICKUP_NAME = process.env.DELHIVERY_PICKUP_NAME || ""
+
 const CHAT_IMAGE_MAX_PER_MESSAGE = 10
 const CHAT_IMAGE_MAX_SIZE_BYTES = 5 * 1024 * 1024 // 5 MB
 const CHAT_IMAGE_ALLOWED_MIME = new Set(["image/jpeg", "image/png", "image/webp"])
@@ -378,6 +382,92 @@ async function sendEmailSafe({ to, subject, html }) {
     console.error(`❌ Email failed: ${subject}`, safeErr(e))
     return { ok: false, error: safeErr(e) }
   }
+}
+
+async function delhiveryRequest(path, options = {}) {
+    if (!DELHIVERY_API_TOKEN) {
+        throw new Error("DELHIVERY_API_TOKEN not configured")
+    }
+
+    const url = `${DELHIVERY_BASE_URL}${path}`
+    const headers = {
+        "Authorization": `Token ${DELHIVERY_API_TOKEN}`,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        ...(options.headers || {}),
+    }
+
+    const response = await fetch(url, {
+        ...options,
+        headers,
+    })
+
+    const text = await response.text()
+    let body
+    try {
+        body = text ? JSON.parse(text) : {}
+    } catch {
+        body = { raw: text }
+    }
+
+    if (!response.ok) {
+        console.error("Delhivery API error:", { url, status: response.status, body })
+        throw new Error(body?.error || body?.rmk || `Delhivery API ${response.status}`)
+    }
+
+    return body
+}
+
+function buildDelhiveryShipmentPayload(order) {
+    const customerName = String(order.name || "Customer").trim()
+    const phone = String(order.phone || "").replace(/\D/g, "").slice(-10)
+    const pincode = String(order.pincode || "").replace(/\D/g, "")
+    const address = String(order.address || "").slice(0, 250)
+
+    if (!pincode || pincode.length !== 6) {
+        throw new Error("Order pincode is missing or invalid")
+    }
+    if (!phone || phone.length !== 10) {
+        throw new Error("Order phone is missing or invalid")
+    }
+
+    return {
+        shipments: [
+            {
+                name: customerName,
+                add: address,
+                pin: pincode,
+                country: "India",
+                phone: phone,
+                order: order.razorpay_order_id || order.id,
+                payment_mode: "Prepaid",
+                return_pin: "",
+                return_city: "",
+                return_phone: "",
+                return_add: "",
+                return_state: "",
+                return_country: "",
+                products_desc: "Personalized printed novel",
+                hsn_code: "",
+                cod_amount: "",
+                order_date: null,
+                total_amount: String(order.total_order_value || order.amount || 0),
+                seller_add: "",
+                seller_name: "SoulScript Legacy",
+                seller_inv: "",
+                quantity: "1",
+                waybill: "",
+                shipment_width: "20",
+                shipment_height: "5",
+                weight: "500",
+                shipping_mode: "Express",
+                address_type: "home",
+            },
+        ],
+        pickup_location: {
+            name: DELHIVERY_PICKUP_NAME,
+        },
+    }
 }
 
 /* =========================
@@ -1230,6 +1320,11 @@ app.get("/health", (req, res) => {
     accountLogin: "email_otp",
     otpExpiryMinutes: OTP_EXPIRY_MINUTES,
     storageBuckets: STORAGE_BUCKETS,
+    delhivery: {
+      configured: Boolean(DELHIVERY_API_TOKEN),
+      pickupName: DELHIVERY_PICKUP_NAME,
+      baseUrl: DELHIVERY_BASE_URL,
+    },
     phase1Endpoints: [
       "GET /admin/orders/:id/download-story",
       "GET /admin/orders/:id/download-voice-notes",
@@ -1252,6 +1347,9 @@ app.get("/health", (req, res) => {
       "POST /story/confirm-extra-writing",
       "GET /admin/extra-writing-requests",
       "PATCH /admin/extra-writing-requests/:id",
+      "POST /admin/orders/:id/delhivery-create-shipment",
+      "GET /admin/orders/:id/delhivery-tracking",
+      "POST /webhooks/delhivery-status",
     ],
     whiteLabelingPrice: WHITE_LABELING_PRICE,
     reviewNotificationEmail: REVIEW_NOTIFICATION_EMAIL,
@@ -5525,6 +5623,208 @@ app.post("/admin/deliverables", requireAdmin, adminAsync(async (req, res) => {
   })
 }))
 
+app.post("/admin/orders/:id/delhivery-create-shipment", requireAdmin, adminAsync(async (req, res) => {
+    const id = adminRequireUuid(req.params.id, "order id")
+
+    const { data: order, error: orderErr } = await supabase
+        .from("orders")
+        .select("*")
+        .eq("id", id)
+        .single()
+
+    if (orderErr || !order) {
+        if (orderErr?.code === "PGRST116") return adminJsonError(res, 404, "Order not found.")
+        return adminHandleSupabaseError(res, orderErr, "Unable to load order.")
+    }
+
+    if (order.awb_number) {
+        return adminJsonError(res, 409, "Shipment already created for this order. AWB: " + order.awb_number)
+    }
+
+    let shipmentResponse
+    try {
+        const payload = buildDelhiveryShipmentPayload(order)
+        const formData = `format=json&data=${encodeURIComponent(JSON.stringify(payload))}`
+
+        shipmentResponse = await delhiveryRequest("/api/cmu/create.json", {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: formData,
+        })
+    } catch (err) {
+        console.error("Delhivery shipment creation failed:", safeErr(err))
+        return adminJsonError(res, 502, err?.message || "Delhivery API error")
+    }
+
+    const packages = shipmentResponse?.packages || []
+    const firstPackage = packages[0] || {}
+    const success = firstPackage.status === "Success" || shipmentResponse?.success === true
+
+    if (!success) {
+        const remark = firstPackage.remarks?.join(", ") || shipmentResponse?.rmk || "Unknown error"
+        return adminJsonError(res, 502, `Delhivery rejected shipment: ${remark}`)
+    }
+
+    const awb = firstPackage.waybill || ""
+    if (!awb) {
+        return adminJsonError(res, 502, "Delhivery did not return a waybill number")
+    }
+
+    const labelUrl = `${DELHIVERY_BASE_URL}/api/p/packing_slip?wbns=${awb}&pdf=true`
+
+    const updates = {
+        awb_number: awb,
+        tracking_number: awb,
+        shipment_status: "in_transit",
+        production_status: "in_transit",
+        order_status: "in_transit",
+        shipping_label_url: labelUrl,
+    }
+
+    const { data: updatedOrder, error: updateErr } = await supabase
+        .from("orders")
+        .update(updates)
+        .eq("id", id)
+        .select("*")
+        .single()
+
+    if (updateErr) {
+        console.error("Order update after Delhivery success failed:", updateErr)
+    }
+
+    if (order.email) {
+        const trackingUrl = `https://www.delhivery.com/track/package/${awb}`
+        await sendEmailSafe({
+            to: order.email,
+            subject: "Your SoulScript Legacy book has been dispatched",
+            html: brandedEmailTemplate({
+                title: "Your book is on the way",
+                bodyHtml:
+                    emailParagraph(`Dear ${escapeHtml(order.name || "")},`) +
+                    emailParagraph("Your personalized novel has been dispatched and is on its way to you.") +
+                    emailDetails([
+                        { label: "Tracking number", value: awb },
+                        { label: "Courier", value: "Delhivery" },
+                    ]),
+                ctaLabel: "Track Shipment",
+                ctaUrl: trackingUrl,
+            }),
+        })
+    }
+
+    return res.json({
+        success: true,
+        awb,
+        labelUrl,
+        order: updatedOrder || null,
+        delhiveryResponse: shipmentResponse,
+    })
+}))
+
+app.get("/admin/orders/:id/delhivery-tracking", requireAdmin, adminAsync(async (req, res) => {
+    const id = adminRequireUuid(req.params.id, "order id")
+
+    const { data: order, error: orderErr } = await supabase
+        .from("orders")
+        .select("id, awb_number, tracking_number")
+        .eq("id", id)
+        .single()
+
+    if (orderErr || !order) {
+        if (orderErr?.code === "PGRST116") return adminJsonError(res, 404, "Order not found.")
+        return adminHandleSupabaseError(res, orderErr, "Unable to load order.")
+    }
+
+    const awb = order.awb_number || order.tracking_number
+    if (!awb) {
+        return adminJsonError(res, 400, "No AWB number on this order")
+    }
+
+    try {
+        const tracking = await delhiveryRequest(`/api/v1/packages/json/?waybill=${encodeURIComponent(awb)}`, {
+            method: "GET",
+        })
+
+        const shipment = tracking?.ShipmentData?.[0]?.Shipment || null
+        const status = shipment?.Status?.Status || ""
+
+        return res.json({
+            success: true,
+            awb,
+            status,
+            tracking,
+        })
+    } catch (err) {
+        console.error("Delhivery tracking failed:", safeErr(err))
+        return adminJsonError(res, 502, err?.message || "Delhivery tracking error")
+    }
+}))
+
+/* =========================
+   DELHIVERY WEBHOOKS
+========================= */
+app.post("/webhooks/delhivery-status", async (req, res) => {
+    try {
+        const payload = req.body || {}
+        console.log("Delhivery webhook received:", JSON.stringify(payload).slice(0, 500))
+
+        const awb = payload?.Shipment?.AWB || payload?.waybill || payload?.awb
+        const status = payload?.Shipment?.Status?.Status || payload?.status || ""
+
+        if (!awb) {
+            return res.status(400).json({ error: "Missing AWB" })
+        }
+
+        const { data: order } = await supabase
+            .from("orders")
+            .select("id, name, email, razorpay_order_id, shipment_status")
+            .eq("awb_number", awb)
+            .single()
+
+        if (!order) {
+            console.warn("Delhivery webhook: no order found for AWB:", awb)
+            return res.json({ ok: true, ignored: true })
+        }
+
+        const statusLower = String(status).toLowerCase()
+        let newStatus = order.shipment_status
+
+        if (statusLower.includes("delivered")) {
+            newStatus = "delivered"
+        } else if (statusLower.includes("transit") || statusLower.includes("dispatched") || statusLower.includes("manifested")) {
+            newStatus = "in_transit"
+        }
+
+        if (newStatus !== order.shipment_status) {
+            const updates = { shipment_status: newStatus }
+            if (newStatus === "delivered") {
+                updates.production_status = "delivered"
+                updates.order_status = "delivered"
+            }
+
+            await supabase.from("orders").update(updates).eq("id", order.id)
+
+            if (newStatus === "delivered" && order.email) {
+                await sendEmailSafe({
+                    to: order.email,
+                    subject: "Your SoulScript Legacy book has been delivered",
+                    html: brandedEmailTemplate({
+                        title: "Your book has arrived",
+                        bodyHtml:
+                            emailParagraph(`Dear ${escapeHtml(order.name || "")},`) +
+                            emailParagraph("Your personalized novel has been delivered. We hope you cherish every page."),
+                    }),
+                })
+            }
+        }
+
+        return res.json({ ok: true, awb, newStatus })
+    } catch (err) {
+        console.error("/webhooks/delhivery-status error:", safeErr(err))
+        return res.status(500).json({ error: "Webhook handler failed" })
+    }
+})
+
 /* =========================
    START SERVER
 ========================= */
@@ -5538,6 +5838,7 @@ app.listen(PORT, () => {
   console.log(`✅ ACCOUNT LOGIN   = Email OTP`)
   console.log(`✅ ADMIN API       = Enabled`)
   console.log(`✅ STORY API       = Enabled`)
+  console.log(`✅ DELHIVERY = ${DELHIVERY_API_TOKEN ? "Configured" : "NOT CONFIGURED"}`)
   console.log(`✅ STORAGE API     = Signed URLs enabled`)
   console.log(`✅ PRINT/SHIPMENT/PAYOUT/REVIEW-CHAT/REVENUE = Enabled`)
   console.log(`✅ PHASE 1 DOWNLOADS = story.txt, voice-notes.zip, cover-material.zip`)
