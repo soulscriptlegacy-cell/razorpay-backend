@@ -1,3 +1,15 @@
+const Sentry = require("@sentry/node")
+
+if (process.env.SENTRY_DSN) {
+    Sentry.init({
+        dsn: process.env.SENTRY_DSN,
+        environment: process.env.NODE_ENV || "production",
+        tracesSampleRate: 0.1,
+        profilesSampleRate: 0.1,
+    })
+    console.log("✅ Sentry initialized")
+}
+
 // index.js (SoulScript Legacy backend)
 // Phase 1 additions:
 // - GET /admin/orders/:id/download-story (story as .txt download)
@@ -16,6 +28,10 @@ const { Resend } = require("resend")
 const { createClient } = require("@supabase/supabase-js")
 
 const app = express()
+
+if (process.env.SENTRY_DSN) {
+    Sentry.setupExpressErrorHandler(app)
+}
 
 const WHITE_LABELING_PRICE = 2000
 const EXTRA_WRITING_PRICE_PER_WORD = 1
@@ -1688,6 +1704,9 @@ app.post("/confirm-payment", async (req, res) => {
       order: insertedOrder,
     })
   } catch (err) {
+    if (typeof Sentry !== "undefined" && process.env.SENTRY_DSN) {
+        Sentry.captureException(err, { tags: { endpoint: "confirm-payment" } })
+    }
     console.error("❌ /confirm-payment error:", safeErr(err))
     return res.status(500).json({
       error: "Payment confirmation failed",
@@ -2390,6 +2409,9 @@ app.post("/story/confirm-extra-writing", async (req, res) => {
             request: { ...request, payment_status: "paid", paid_at: now, razorpay_payment_id },
         })
     } catch (err) {
+        if (typeof Sentry !== "undefined" && process.env.SENTRY_DSN) {
+            Sentry.captureException(err, { tags: { endpoint: "confirm-extra-writing" } })
+        }
         console.error("/story/confirm-extra-writing error:", safeErr(err))
         return res.status(500).json({ error: "Extra writing payment confirmation failed" })
     }
@@ -2570,6 +2592,9 @@ app.post("/story/confirm-addon-payment", async (req, res) => {
 
     return res.json({ success: true, addon })
   } catch (err) {
+    if (typeof Sentry !== "undefined" && process.env.SENTRY_DSN) {
+        Sentry.captureException(err, { tags: { endpoint: "confirm-addon-payment" } })
+    }
     console.error("❌ /story/confirm-addon-payment error:", safeErr(err))
     return res.status(500).json({ error: "Add-on payment confirmation failed" })
   }
@@ -3261,6 +3286,9 @@ app.post("/story/confirm-balance-payment", async (req, res) => {
 
     return res.json({ success: true, balancePaid: true })
   } catch (err) {
+    if (typeof Sentry !== "undefined" && process.env.SENTRY_DSN) {
+        Sentry.captureException(err, { tags: { endpoint: "confirm-balance-payment" } })
+    }
     console.error("❌ /story/confirm-balance-payment error:", safeErr(err))
     return res.status(500).json({ error: "Balance payment confirmation failed" })
   }
@@ -3523,6 +3551,9 @@ app.post("/story/confirm-cart-payment", async (req, res) => {
       polaroidUploadSlots,
     })
   } catch (err) {
+    if (typeof Sentry !== "undefined" && process.env.SENTRY_DSN) {
+        Sentry.captureException(err, { tags: { endpoint: "confirm-cart-payment" } })
+    }
     console.error("❌ /story/confirm-cart-payment error:", safeErr(err))
     return res.status(500).json({ error: "Cart payment confirmation failed" })
   }
@@ -4824,175 +4855,183 @@ app.post("/admin/orders/:id/send-story-reminder", requireAdmin, adminAsync(async
    to fill in if customer didn't provide them in story intake.
 ========================= */
 async function handleAdminUploadReviewFiles(req, res) {
-  const id = adminRequireUuid(req.params.id, "order id")
+    try {
+      const id = adminRequireUuid(req.params.id, "order id")
 
-  const manuscriptFile = uploadedFile(req, ["manuscript_pdf", "manuscriptPdf", "pdf"])
-  const coverFile = uploadedFile(req, ["cover_file", "coverFile", "cover"])
-  const managerNote = normalizeText(req.body?.manager_note ?? req.body?.managerNote ?? "", 4000) || null
+      const manuscriptFile = uploadedFile(req, ["manuscript_pdf", "manuscriptPdf", "pdf"])
+      const coverFile = uploadedFile(req, ["cover_file", "coverFile", "cover"])
+      const managerNote = normalizeText(req.body?.manager_note ?? req.body?.managerNote ?? "", 4000) || null
 
-  // PHASE 1: Optional title and author_name from manager (if customer didn't provide them)
-  const managerTitle = normalizeText(req.body?.title ?? req.body?.cover_title ?? "", 300)
-  const managerAuthorName = normalizeText(req.body?.author_name ?? req.body?.authorName ?? "", 180)
+      // PHASE 1: Optional title and author_name from manager (if customer didn't provide them)
+      const managerTitle = normalizeText(req.body?.title ?? req.body?.cover_title ?? "", 300)
+      const managerAuthorName = normalizeText(req.body?.author_name ?? req.body?.authorName ?? "", 180)
 
-  if (!manuscriptFile && !coverFile) {
-    return adminJsonError(res, 400, "Upload manuscript PDF or cover file.")
-  }
-
-  if (manuscriptFile && manuscriptFile.mimetype !== "application/pdf") {
-    return adminJsonError(res, 400, "Manuscript file must be a PDF.")
-  }
-
-  const allowedCoverTypes = new Set([
-    "application/pdf",
-    "image/jpeg",
-    "image/png",
-    "image/webp",
-  ])
-
-  if (coverFile && !allowedCoverTypes.has(coverFile.mimetype)) {
-    return adminJsonError(res, 400, "Cover file must be PDF, JPG, PNG, or WEBP.")
-  }
-
-  const { data: order, error: orderErr } = await supabase
-    .from("orders")
-    .select("id, razorpay_order_id, name, email, edition")
-    .eq("id", id)
-    .single()
-
-  if (orderErr || !order) {
-    if (orderErr?.code === "PGRST116") return adminJsonError(res, 404, "Order not found.")
-    return adminHandleSupabaseError(res, orderErr, "Unable to load order.")
-  }
-
-  // PHASE 1: If manager provided title/author, backfill them on the latest submitted intake
-  // ONLY if those fields are currently empty (we never overwrite customer-provided values)
-  if (managerTitle || managerAuthorName) {
-    const { data: latestSubmittedIntakes } = await supabase
-      .from("story_intakes")
-      .select("id, title, cover_title, author_name")
-      .eq("order_id", id)
-      .order("updated_at", { ascending: false })
-      .limit(1)
-
-    const latestIntake = (latestSubmittedIntakes || [])[0]
-
-    if (latestIntake) {
-      const intakeUpdate = {}
-
-      const existingTitle = firstNonEmpty(latestIntake.title, latestIntake.cover_title)
-      if (managerTitle && !existingTitle) {
-        intakeUpdate.title = managerTitle
-        intakeUpdate.cover_title = managerTitle
+      if (!manuscriptFile && !coverFile) {
+        return adminJsonError(res, 400, "Upload manuscript PDF or cover file.")
       }
 
-      const existingAuthor = firstNonEmpty(latestIntake.author_name)
-      if (managerAuthorName && !existingAuthor) {
-        intakeUpdate.author_name = managerAuthorName
+      if (manuscriptFile && manuscriptFile.mimetype !== "application/pdf") {
+        return adminJsonError(res, 400, "Manuscript file must be a PDF.")
       }
 
-      if (Object.keys(intakeUpdate).length > 0) {
-        intakeUpdate.updated_at = new Date().toISOString()
-        const { error: backfillErr } = await supabase
+      const allowedCoverTypes = new Set([
+        "application/pdf",
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+      ])
+
+      if (coverFile && !allowedCoverTypes.has(coverFile.mimetype)) {
+        return adminJsonError(res, 400, "Cover file must be PDF, JPG, PNG, or WEBP.")
+      }
+
+      const { data: order, error: orderErr } = await supabase
+        .from("orders")
+        .select("id, razorpay_order_id, name, email, edition")
+        .eq("id", id)
+        .single()
+
+      if (orderErr || !order) {
+        if (orderErr?.code === "PGRST116") return adminJsonError(res, 404, "Order not found.")
+        return adminHandleSupabaseError(res, orderErr, "Unable to load order.")
+      }
+
+      // PHASE 1: If manager provided title/author, backfill them on the latest submitted intake
+      // ONLY if those fields are currently empty (we never overwrite customer-provided values)
+      if (managerTitle || managerAuthorName) {
+        const { data: latestSubmittedIntakes } = await supabase
           .from("story_intakes")
-          .update(intakeUpdate)
-          .eq("id", latestIntake.id)
+          .select("id, title, cover_title, author_name")
+          .eq("order_id", id)
+          .order("updated_at", { ascending: false })
+          .limit(1)
 
-        if (backfillErr) {
-          console.error("⚠️ Manager title/author backfill failed:", backfillErr)
+        const latestIntake = (latestSubmittedIntakes || [])[0]
+
+        if (latestIntake) {
+          const intakeUpdate = {}
+
+          const existingTitle = firstNonEmpty(latestIntake.title, latestIntake.cover_title)
+          if (managerTitle && !existingTitle) {
+            intakeUpdate.title = managerTitle
+            intakeUpdate.cover_title = managerTitle
+          }
+
+          const existingAuthor = firstNonEmpty(latestIntake.author_name)
+          if (managerAuthorName && !existingAuthor) {
+            intakeUpdate.author_name = managerAuthorName
+          }
+
+          if (Object.keys(intakeUpdate).length > 0) {
+            intakeUpdate.updated_at = new Date().toISOString()
+            const { error: backfillErr } = await supabase
+              .from("story_intakes")
+              .update(intakeUpdate)
+              .eq("id", latestIntake.id)
+
+            if (backfillErr) {
+              console.error("⚠️ Manager title/author backfill failed:", backfillErr)
+            }
+          }
         }
       }
+
+      const now = new Date().toISOString()
+      const versionNumber = await getNextReviewVersion(id)
+
+      const manuscriptPath = manuscriptFile
+        ? await uploadReviewStorageFile(id, versionNumber, manuscriptFile, "manuscript")
+        : null
+
+      const coverPath = coverFile
+        ? await uploadReviewStorageFile(id, versionNumber, coverFile, "cover")
+        : null
+
+      const { data: reviewFile, error: reviewFileErr } = await supabase
+        .from("review_files")
+        .insert({
+          order_id: id,
+          version_number: versionNumber,
+          manuscript_pdf_path: manuscriptPath,
+          cover_file_path: coverPath,
+          manager_note: managerNote,
+          status: "sent_for_review",
+          sent_for_review_at: now,
+        })
+        .select("*")
+        .single()
+
+      if (reviewFileErr || !reviewFile) {
+        return adminHandleSupabaseError(res, reviewFileErr, "Unable to create review file.")
+      }
+
+      const { data: deliverable, error: deliverableErr } = await supabase
+        .from("deliverables")
+        .insert({
+          order_id: id,
+          pdf_path: manuscriptPath,
+          cover_path: coverPath,
+          uploaded_at: now,
+          review_file_id: reviewFile.id,
+          status: "waiting_customer_review",
+        })
+        .select("*")
+        .single()
+
+      if (deliverableErr || !deliverable) {
+        return adminHandleSupabaseError(res, deliverableErr, "Unable to create deliverable.")
+      }
+
+      await supabase
+        .from("orders")
+        .update({
+          production_status: "review_ready",
+          order_status: "review_ready",
+          latest_review_file_id: reviewFile.id,
+        })
+        .eq("id", id)
+
+      const signedReviewFile = (await withSignedReviewFiles([reviewFile]))[0]
+      const signedDeliverable = (await withSignedDeliverables([deliverable]))[0]
+      const portalUrl = `${PORTAL_BASE_URL}/story?order=${encodeURIComponent(order.razorpay_order_id)}`
+
+      if (order.email) {
+        await sendEmailSafe({
+          to: order.email,
+          subject: "Your review files are ready",
+          html: brandedEmailTemplate({
+            title: "Your review files are ready",
+            bodyHtml:
+              emailParagraph(`Dear ${escapeHtml(order.name || "SoulScript customer")},`) +
+              emailParagraph("Your manuscript and cover review files are now available in your story portal.") +
+              emailParagraph("Please review them carefully. You can approve them for printing or request changes from the portal.") +
+              (managerNote
+                ? emailDivider() +
+                  emailParagraph("<strong>A note from your team:</strong>") +
+                  emailMuted(nl2br(managerNote))
+                : ""),
+            ctaLabel: "Open Review Portal",
+            ctaUrl: portalUrl,
+          }),
+        })
+      }
+
+      return res.json({
+        success: true,
+        review_file: signedReviewFile,
+        deliverable: signedDeliverable,
+        signedUrls: {
+          manuscript_pdf_url: signedReviewFile?.manuscript_pdf_signed_url || null,
+          cover_file_url: signedReviewFile?.cover_file_signed_url || null,
+        },
+      })    } catch (err) {
+        if (typeof Sentry !== "undefined" && process.env.SENTRY_DSN) {
+            Sentry.captureException(err, { tags: { endpoint: "upload-review-files" } })
+        }
+        console.error("❌ /admin/orders/:id/upload-review-files error:", safeErr(err))
+        throw err
     }
-  }
 
-  const now = new Date().toISOString()
-  const versionNumber = await getNextReviewVersion(id)
-
-  const manuscriptPath = manuscriptFile
-    ? await uploadReviewStorageFile(id, versionNumber, manuscriptFile, "manuscript")
-    : null
-
-  const coverPath = coverFile
-    ? await uploadReviewStorageFile(id, versionNumber, coverFile, "cover")
-    : null
-
-  const { data: reviewFile, error: reviewFileErr } = await supabase
-    .from("review_files")
-    .insert({
-      order_id: id,
-      version_number: versionNumber,
-      manuscript_pdf_path: manuscriptPath,
-      cover_file_path: coverPath,
-      manager_note: managerNote,
-      status: "sent_for_review",
-      sent_for_review_at: now,
-    })
-    .select("*")
-    .single()
-
-  if (reviewFileErr || !reviewFile) {
-    return adminHandleSupabaseError(res, reviewFileErr, "Unable to create review file.")
-  }
-
-  const { data: deliverable, error: deliverableErr } = await supabase
-    .from("deliverables")
-    .insert({
-      order_id: id,
-      pdf_path: manuscriptPath,
-      cover_path: coverPath,
-      uploaded_at: now,
-      review_file_id: reviewFile.id,
-      status: "waiting_customer_review",
-    })
-    .select("*")
-    .single()
-
-  if (deliverableErr || !deliverable) {
-    return adminHandleSupabaseError(res, deliverableErr, "Unable to create deliverable.")
-  }
-
-  await supabase
-    .from("orders")
-    .update({
-      production_status: "review_ready",
-      order_status: "review_ready",
-      latest_review_file_id: reviewFile.id,
-    })
-    .eq("id", id)
-
-  const signedReviewFile = (await withSignedReviewFiles([reviewFile]))[0]
-  const signedDeliverable = (await withSignedDeliverables([deliverable]))[0]
-  const portalUrl = `${PORTAL_BASE_URL}/story?order=${encodeURIComponent(order.razorpay_order_id)}`
-
-  if (order.email) {
-    await sendEmailSafe({
-      to: order.email,
-      subject: "Your review files are ready",
-      html: brandedEmailTemplate({
-        title: "Your review files are ready",
-        bodyHtml:
-          emailParagraph(`Dear ${escapeHtml(order.name || "SoulScript customer")},`) +
-          emailParagraph("Your manuscript and cover review files are now available in your story portal.") +
-          emailParagraph("Please review them carefully. You can approve them for printing or request changes from the portal.") +
-          (managerNote
-            ? emailDivider() +
-              emailParagraph("<strong>A note from your team:</strong>") +
-              emailMuted(nl2br(managerNote))
-            : ""),
-        ctaLabel: "Open Review Portal",
-        ctaUrl: portalUrl,
-      }),
-    })
-  }
-
-  return res.json({
-    success: true,
-    review_file: signedReviewFile,
-    deliverable: signedDeliverable,
-    signedUrls: {
-      manuscript_pdf_url: signedReviewFile?.manuscript_pdf_signed_url || null,
-      cover_file_url: signedReviewFile?.cover_file_signed_url || null,
-    },
-  })
 }
 
 app.post(
@@ -5700,6 +5739,9 @@ app.post("/admin/orders/:id/delhivery-create-shipment", requireAdmin, adminAsync
             body: formData,
         })
     } catch (err) {
+        if (typeof Sentry !== "undefined" && process.env.SENTRY_DSN) {
+            Sentry.captureException(err, { tags: { endpoint: "delhivery-create-shipment" } })
+        }
         console.error("Delhivery shipment creation failed:", safeErr(err))
         return adminJsonError(res, 502, err?.message || "Delhivery API error")
     }
@@ -5882,6 +5924,7 @@ app.listen(PORT, () => {
   console.log(`✅ Server running on port ${PORT}`)
   console.log(`✅ RAZORPAY MODE = ${RAZORPAY_MODE.toUpperCase()}`)
   console.log(`✅ RATE LIMITING = Enabled on auth + portal endpoints`)
+  console.log(`✅ SENTRY = ${process.env.SENTRY_DSN ? "Enabled" : "Disabled"}`)
   console.log(`✅ PORTAL_BASE_URL = ${PORTAL_BASE_URL}`)
   console.log(`✅ EMAIL_FROM      = ${EMAIL_FROM}`)
   console.log(`✅ ADMIN_EMAIL     = ${ADMIN_EMAIL}`)
