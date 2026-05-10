@@ -526,11 +526,12 @@ function buildDelhiveryShipmentPayload(order) {
         shipments: [
             {
                 name: customerName,
-                add: address,
+                add: `${address}${phone ? ` | Ph: ${phone}` : ""}`.slice(0, 250),
                 pin: pincode,
                 country: "India",
                 phone: phone,
                 order: order.razorpay_order_id || order.id,
+                client: "SoulScript Legacy",
                 payment_mode: "Prepaid",
                 return_pin: returnPin,
                 return_city: cleanDelhiveryText(DELHIVERY_RETURN_CITY, 80),
@@ -538,7 +539,7 @@ function buildDelhiveryShipmentPayload(order) {
                 return_add: returnAddress,
                 return_state: cleanDelhiveryText(DELHIVERY_RETURN_STATE, 80),
                 return_country: returnAddress ? "India" : "",
-                products_desc: "Personalized printed novel",
+                products_desc: String(order.edition || "SoulScript Legacy novel"),
                 hsn_code: "",
                 cod_amount: "",
                 order_date: null,
@@ -2237,7 +2238,8 @@ app.get("/portal-order", rateLimit({ windowMs: 60 * 1000, maxRequests: 30, keyPr
 
     if (token) {
       if (order.portal_token_used) {
-        return res.status(410).json({ error: "Link already used. Please request a new link." })
+        // Token was already consumed. Redirect to safer order-ID URL instead of locking out.
+        return res.redirect(302, `${PORTAL_BASE_URL}/story?order=${encodeURIComponent(order.razorpay_order_id)}`)
       }
 
       if (order.portal_token_expires_at) {
