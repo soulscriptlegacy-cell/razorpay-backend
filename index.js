@@ -5865,7 +5865,7 @@ app.get("/admin/orders/:id/delhivery-label", requireAdmin, adminAsync(async (req
             method: "GET",
             headers: {
                 "Authorization": `Token ${DELHIVERY_API_TOKEN}`,
-                "Accept": "application/pdf",
+               
             },
         })
 
