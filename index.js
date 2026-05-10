@@ -5890,6 +5890,27 @@ app.get("/admin/orders/:id/delhivery-label", requireAdmin, adminAsync(async (req
             return adminJsonError(res, 500, "Delhivery is not configured")
         }
 
+        const { data: paidAddons } = await supabase
+            .from("order_addons")
+            .select("addon_type, title")
+            .eq("order_id", id)
+            .or("status.eq.paid,payment_status.eq.paid")
+
+        const customizationTypes = new Set([
+            "white_labeling",
+            "custom_cover",
+            "extra_polaroids_pack",
+            "extra_softcover_copy",
+            "extra_hardcover_copy",
+            "voice_note_hour",
+            "ultra_priority",
+        ])
+
+        const hasCustomization = (paidAddons || []).some(a => customizationTypes.has(a.addon_type))
+        const contentsLine = hasCustomization
+            ? `${order.edition} + Customization`
+            : order.edition
+
         const jsonUrl = `${DELHIVERY_BASE_URL}/api/p/packing_slip?wbns=${encodeURIComponent(awb)}&verbose=true`
         const response = await fetch(jsonUrl, {
             method: "GET",
@@ -5999,10 +6020,6 @@ app.get("/admin/orders/:id/delhivery-label", requireAdmin, adminAsync(async (req
         const address = cleanText(order.address, 260)
         const pincode = cleanText(destinationPin || order.pincode, 12)
         const edition = cleanText(order.edition || "SoulScript Legacy novel", 120)
-        const returnAddress = cleanText(
-            "Tatibandh, Kabir Nagar, Near Tiranga Chowk / Siddhi Vinayak Chowk, Shivalay Shiv Mandir MIG 101 (M2), Raipur, Chhattisgarh, India",
-            260
-        )
         const originAddress = "Tatibandh, Kabir Nagar Colony, Face 2, M-2, Near Tiranga Chowk, Behind Shivalay, Shiv Mandir MIG 101 (M2), Raipur, Chhattisgarh, India"
 
         const doc = new PDFDocument({
@@ -6017,18 +6034,24 @@ app.get("/admin/orders/:id/delhivery-label", requireAdmin, adminAsync(async (req
 
         doc.rect(0, 0, 288, 432).fill("#FAF7F1")
 
-        doc.font("Helvetica-Bold")
-            .fontSize(9)
+        doc.font("Times-Roman")
+            .fontSize(14)
             .fillColor("#0E0E0E")
-            .text("SOULSCRIPT", 14, 18, { characterSpacing: 3, lineBreak: false })
+            .text("SOULSCRIPT", 14, 18, {
+                characterSpacing: 5,
+                lineBreak: false,
+            })
         doc.font("Helvetica")
             .fontSize(5.5)
             .fillColor("#8B8680")
-            .text("LEGACY", 14, 30, { characterSpacing: 3, lineBreak: false })
+            .text("LEGACY", 14, 36, {
+                characterSpacing: 5.5,
+                lineBreak: false,
+            })
         doc.font("Helvetica")
             .fontSize(5.5)
             .fillColor("#8B8680")
-            .text("EST. MMXXV", 190, 18, {
+            .text("EST. 2025", 190, 18, {
                 width: 84,
                 align: "right",
                 characterSpacing: 2,
@@ -6063,7 +6086,7 @@ app.get("/admin/orders/:id/delhivery-label", requireAdmin, adminAsync(async (req
         doc.font("Helvetica")
             .fontSize(7)
             .fillColor("#0E0E0E")
-            .text(`T  ${phone || "-"}`, 14, phoneY, { width: 160, lineBreak: false })
+            .text(`Phone: ${order.phone || ""}`, 14, phoneY, { width: 160 })
         doc.font("Helvetica-Bold")
             .fontSize(7)
             .fillColor("#0E0E0E")
@@ -6078,7 +6101,9 @@ app.get("/admin/orders/:id/delhivery-label", requireAdmin, adminAsync(async (req
         doc.font("Helvetica-Bold")
             .fontSize(11)
             .fillColor("#0E0E0E")
-            .text(formatAmount(totalValue), 190, 178, { width: 84, lineBreak: false })
+            .text(`INR ${Number(order.total_order_value || order.amount || 0).toLocaleString("en-IN")}`, 190, 178, {
+                width: 84,
+            })
         labelText(doc, "DATE", 190, 200)
         doc.font("Helvetica")
             .fontSize(7)
@@ -6086,7 +6111,7 @@ app.get("/admin/orders/:id/delhivery-label", requireAdmin, adminAsync(async (req
             .text(formatDate(), 190, 208, { width: 84, lineBreak: false })
         drawRule(doc, 260)
 
-        labelText(doc, "ORIGIN", 14, 272)
+        labelText(doc, "ORIGIN / RETURN", 14, 272)
         doc.font("Helvetica-Bold")
             .fontSize(7)
             .fillColor("#0E0E0E")
@@ -6101,7 +6126,7 @@ app.get("/admin/orders/:id/delhivery-label", requireAdmin, adminAsync(async (req
         doc.font("Helvetica")
             .fontSize(7.5)
             .fillColor("#0E0E0E")
-            .text(edition, 14, 333, { width: 190, lineBreak: false })
+            .text(contentsLine, 14, 333, { width: 240 })
         doc.font("Helvetica")
             .fontSize(7.5)
             .fillColor("#0E0E0E")
@@ -6118,17 +6143,6 @@ app.get("/admin/orders/:id/delhivery-label", requireAdmin, adminAsync(async (req
                 characterSpacing: 1.5,
                 lineBreak: false,
             })
-
-        drawRule(doc, 400, "#B8975A")
-        labelText(doc, "RETURN", 14, 408)
-        doc.font("Helvetica")
-            .fontSize(5.5)
-            .fillColor("#0E0E0E")
-            .text(returnAddress, 14, 416, { width: 200, lineGap: 1.5 })
-        doc.font("Helvetica")
-            .fontSize(5)
-            .fillColor("#8B8680")
-            .text("01 / 01", 220, 416, { width: 54, align: "right", lineBreak: false })
 
         doc.end()
     } catch (err) {
