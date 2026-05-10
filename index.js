@@ -21,6 +21,7 @@ if (process.env.SENTRY_DSN) {
 const express = require("express")
 const Razorpay = require("razorpay")
 const crypto = require("crypto")
+const { Readable } = require("stream")
 const cors = require("cors")
 const multer = require("multer")
 const archiver = require("archiver")
@@ -182,6 +183,14 @@ function hashOtp(email, otp) {
 function normalizeText(value, max = 5000) {
   const text = String(value || "").trim()
   return text.slice(0, max)
+}
+
+function normalizePincode(value) {
+    return String(value || "").trim()
+}
+
+function isValidPincode(value) {
+    return /^\d{6}$/.test(normalizePincode(value))
 }
 
 function isUuid(value) {
@@ -1033,7 +1042,7 @@ const ADDON_PRICES = {
   custom_cover: 499,
   extra_softcover_copy: 399,
   extra_hardcover_copy: 499,
-  extra_polaroids_pack: 249,
+  extra_polaroids_pack: 299,
   white_labeling: 2000,
 }
 
@@ -1381,6 +1390,7 @@ app.get("/health", (req, res) => {
     adminEmail: ADMIN_EMAIL,
     pricing: EDITION_PRICES,
     addOns: ADDON_PRICES,
+    addonPrices: ADDON_PRICES,
     accountLogin: "email_otp",
     otpExpiryMinutes: OTP_EXPIRY_MINUTES,
     storageBuckets: STORAGE_BUCKETS,
@@ -1412,6 +1422,7 @@ app.get("/health", (req, res) => {
       "GET /admin/extra-writing-requests",
       "PATCH /admin/extra-writing-requests/:id",
       "POST /admin/orders/:id/delhivery-create-shipment",
+      "GET /admin/orders/:id/delhivery-label",
       "GET /admin/orders/:id/delhivery-tracking",
       "POST /webhooks/delhivery-status",
     ],
@@ -1501,6 +1512,12 @@ app.post("/create-order", async (req, res) => {
       return res.status(400).json({ error: "Customer details missing" })
     }
 
+    if (!isValidPincode(customer.pincode)) {
+      return res.status(400).json({ error: "Dear, please enter a valid 6-digit pincode." })
+    }
+
+    const pincode = normalizePincode(customer.pincode)
+
     if (!["PREPAID", "ADVANCE"].includes(paymentType)) {
       return res.status(400).json({ error: "Invalid payment type" })
     }
@@ -1531,6 +1548,7 @@ app.post("/create-order", async (req, res) => {
         customerName: customer.name,
         customerEmail: String(customer.email).trim().toLowerCase(),
         customerPhone: customer.phone,
+        customerPincode: pincode,
       },
     })
 
@@ -1578,6 +1596,12 @@ app.post("/confirm-payment", async (req, res) => {
       return res.status(400).json({ error: "Missing required payment data" })
     }
 
+    if (!isValidPincode(customer.pincode)) {
+      return res.status(400).json({ error: "Dear, please enter a valid 6-digit pincode." })
+    }
+
+    const pincode = normalizePincode(customer.pincode)
+
     const expectedSignature = crypto
       .createHmac("sha256", RAZORPAY_KEY_SECRET)
       .update(razorpay_order_id + "|" + razorpay_payment_id)
@@ -1622,6 +1646,7 @@ app.post("/confirm-payment", async (req, res) => {
           email: normalizedEmail,
           phone: customer.phone,
           address: customer.address,
+          pincode,
         },
       ])
       .select("*")
@@ -5811,12 +5836,69 @@ app.post("/admin/orders/:id/delhivery-create-shipment", requireAdmin, adminAsync
     })
 }))
 
-app.get("/admin/orders/:id/delhivery-tracking", requireAdmin, adminAsync(async (req, res) => {
+app.get("/admin/orders/:id/delhivery-label", requireAdmin, adminAsync(async (req, res) => {
     const id = adminRequireUuid(req.params.id, "order id")
 
     const { data: order, error: orderErr } = await supabase
         .from("orders")
         .select("id, awb_number, tracking_number")
+        .eq("id", id)
+        .single()
+
+    if (orderErr || !order) {
+        if (orderErr?.code === "PGRST116") return adminJsonError(res, 404, "Order not found.")
+        return adminHandleSupabaseError(res, orderErr, "Unable to load order.")
+    }
+
+    const awb = order.awb_number || order.tracking_number
+    if (!awb) {
+        return adminJsonError(res, 400, "No AWB number on this order")
+    }
+
+    if (!DELHIVERY_API_TOKEN) {
+        return adminJsonError(res, 500, "Delhivery is not configured")
+    }
+
+    try {
+        const url = `${DELHIVERY_BASE_URL}/api/p/packing_slip?wbns=${encodeURIComponent(awb)}&pdf=true`
+        const response = await fetch(url, {
+            method: "GET",
+            headers: {
+                "Authorization": `Token ${DELHIVERY_API_TOKEN}`,
+                "Accept": "application/pdf",
+            },
+        })
+
+        if (!response.ok) {
+            const errorText = await response.text().catch(() => "")
+            console.error("Delhivery label fetch failed:", {
+                status: response.status,
+                error: errorText.slice(0, 500),
+            })
+            return adminJsonError(res, 502, "Could not fetch Delhivery label")
+        }
+
+        res.setHeader("Content-Type", "application/pdf")
+        res.setHeader("Content-Disposition", `attachment; filename="SoulScript-label-${awb}.pdf"`)
+
+        if (response.body && typeof Readable.fromWeb === "function") {
+            return Readable.fromWeb(response.body).pipe(res)
+        }
+
+        const arrayBuffer = await response.arrayBuffer()
+        return res.send(Buffer.from(arrayBuffer))
+    } catch (err) {
+        console.error("Delhivery label download failed:", safeErr(err))
+        return adminJsonError(res, 502, err?.message || "Delhivery label download error")
+    }
+}))
+
+app.get("/admin/orders/:id/delhivery-tracking", requireAdmin, adminAsync(async (req, res) => {
+    const id = adminRequireUuid(req.params.id, "order id")
+
+    const { data: order, error: orderErr } = await supabase
+        .from("orders")
+        .select("id, name, email, awb_number, tracking_number, shipment_status")
         .eq("id", id)
         .single()
 
@@ -5837,11 +5919,63 @@ app.get("/admin/orders/:id/delhivery-tracking", requireAdmin, adminAsync(async (
 
         const shipment = tracking?.ShipmentData?.[0]?.Shipment || null
         const status = shipment?.Status?.Status || ""
+        const statusLower = String(status).toLowerCase()
+        let mappedStatus = null
+
+        if (statusLower.includes("delivered")) {
+            mappedStatus = "delivered"
+        } else if (
+            statusLower.includes("transit") ||
+            statusLower.includes("dispatched") ||
+            statusLower.includes("manifested") ||
+            statusLower.includes("shipped")
+        ) {
+            mappedStatus = "in_transit"
+        }
+
+        let updatedOrder = order
+
+        if (mappedStatus) {
+            const updates = {
+                shipment_status: mappedStatus,
+                production_status: mappedStatus,
+                order_status: mappedStatus,
+            }
+
+            const { data, error: updateErr } = await supabase
+                .from("orders")
+                .update(updates)
+                .eq("id", id)
+                .select("*")
+                .single()
+
+            if (updateErr) {
+                console.error("Order update after Delhivery tracking failed:", updateErr)
+                return adminHandleSupabaseError(res, updateErr, "Unable to update tracking status.")
+            }
+
+            updatedOrder = data || order
+
+            if (mappedStatus === "delivered" && order.shipment_status !== "delivered" && order.email) {
+                await sendEmailSafe({
+                    to: order.email,
+                    subject: "Your SoulScript Legacy book has been delivered",
+                    html: brandedEmailTemplate({
+                        title: "Your book has arrived",
+                        bodyHtml:
+                            emailParagraph(`Dear ${escapeHtml(order.name || "")},`) +
+                            emailParagraph("Your personalized novel has been delivered. We hope you cherish every page."),
+                    }),
+                })
+            }
+        }
 
         return res.json({
             success: true,
             awb,
             status,
+            mappedStatus,
+            order: updatedOrder,
             tracking,
         })
     } catch (err) {
@@ -5849,7 +5983,6 @@ app.get("/admin/orders/:id/delhivery-tracking", requireAdmin, adminAsync(async (
         return adminJsonError(res, 502, err?.message || "Delhivery tracking error")
     }
 }))
-
 /* =========================
    DELHIVERY WEBHOOKS
 ========================= */
@@ -5881,7 +6014,7 @@ app.post("/webhooks/delhivery-status", async (req, res) => {
 
         if (statusLower.includes("delivered")) {
             newStatus = "delivered"
-        } else if (statusLower.includes("transit") || statusLower.includes("dispatched") || statusLower.includes("manifested")) {
+        } else if (statusLower.includes("transit") || statusLower.includes("dispatched") || statusLower.includes("manifested") || statusLower.includes("shipped")) {
             newStatus = "in_transit"
         }
 
