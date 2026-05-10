@@ -526,12 +526,11 @@ function buildDelhiveryShipmentPayload(order) {
         shipments: [
             {
                 name: customerName,
-                add: `${address}${phone ? ` | Ph: ${phone}` : ""}`.slice(0, 250),
+                add: address,
                 pin: pincode,
                 country: "India",
                 phone: phone,
                 order: order.razorpay_order_id || order.id,
-                client: "SoulScript Legacy",
                 payment_mode: "Prepaid",
                 return_pin: returnPin,
                 return_city: cleanDelhiveryText(DELHIVERY_RETURN_CITY, 80),
