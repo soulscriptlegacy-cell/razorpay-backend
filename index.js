@@ -72,6 +72,45 @@ const must = (key) => {
   return v
 }
 
+const rateLimitStore = new Map()
+
+function cleanupRateLimits() {
+    const now = Date.now()
+    for (const [key, entry] of rateLimitStore.entries()) {
+        if (entry.resetAt < now) rateLimitStore.delete(key)
+    }
+}
+
+setInterval(cleanupRateLimits, 60 * 1000)
+
+function rateLimit({ windowMs, maxRequests, keyPrefix = "global" }) {
+    return (req, res, next) => {
+        const ip = req.ip || req.headers["x-forwarded-for"] || req.connection.remoteAddress || "unknown"
+        const ipFirst = String(ip).split(",")[0].trim()
+        const key = `${keyPrefix}:${ipFirst}`
+
+        const now = Date.now()
+        const entry = rateLimitStore.get(key)
+
+        if (!entry || entry.resetAt < now) {
+            rateLimitStore.set(key, { count: 1, resetAt: now + windowMs })
+            return next()
+        }
+
+        if (entry.count >= maxRequests) {
+            const retryAfter = Math.ceil((entry.resetAt - now) / 1000)
+            res.setHeader("Retry-After", retryAfter)
+            return res.status(429).json({
+                error: "Too many requests. Please slow down.",
+                retryAfterSeconds: retryAfter,
+            })
+        }
+
+        entry.count += 1
+        return next()
+    }
+}
+
 const safeErr = (e) => {
   const obj = {
     message: e?.message || String(e),
@@ -902,8 +941,16 @@ const ADMIN_EMAIL = process.env.ADMIN_EMAIL || "soulscriptlegacy@gmail.com"
 /* =========================
    RAZORPAY
 ========================= */
-const RAZORPAY_KEY_ID = must("RAZORPAY_KEY_ID")
-const RAZORPAY_KEY_SECRET = must("RAZORPAY_KEY_SECRET")
+const RAZORPAY_MODE = (process.env.RAZORPAY_MODE || "live").toLowerCase()
+const RAZORPAY_USE_TEST = RAZORPAY_MODE === "test"
+
+const RAZORPAY_KEY_ID = RAZORPAY_USE_TEST
+    ? (process.env.RAZORPAY_KEY_ID_TEST || must("RAZORPAY_KEY_ID"))
+    : must("RAZORPAY_KEY_ID")
+
+const RAZORPAY_KEY_SECRET = RAZORPAY_USE_TEST
+    ? (process.env.RAZORPAY_KEY_SECRET_TEST || must("RAZORPAY_KEY_SECRET"))
+    : must("RAZORPAY_KEY_SECRET")
 
 const razorpay = new Razorpay({
   key_id: RAZORPAY_KEY_ID,
@@ -1312,6 +1359,7 @@ app.get("/health", (req, res) => {
   return res.json({
     ok: true,
     time: new Date().toISOString(),
+    razorpayMode: RAZORPAY_MODE,
     portalBase: PORTAL_BASE_URL,
     emailFrom: EMAIL_FROM,
     adminEmail: ADMIN_EMAIL,
@@ -1744,7 +1792,7 @@ async function sendAccountOtpForEmail(email, res) {
   }
 }
 
-app.post("/account/send-otp", async (req, res) => {
+app.post("/account/send-otp", rateLimit({ windowMs: 60 * 60 * 1000, maxRequests: 5, keyPrefix: "otp" }), async (req, res) => {
   try {
     return await sendAccountOtpForEmail(req.body?.email, res)
   } catch (err) {
@@ -1753,7 +1801,7 @@ app.post("/account/send-otp", async (req, res) => {
   }
 })
 
-app.post("/account/send-login-link", async (req, res) => {
+app.post("/account/send-login-link", rateLimit({ windowMs: 60 * 60 * 1000, maxRequests: 5, keyPrefix: "otp" }), async (req, res) => {
   try {
     return await sendAccountOtpForEmail(req.body?.email, res)
   } catch (err) {
@@ -1762,7 +1810,7 @@ app.post("/account/send-login-link", async (req, res) => {
   }
 })
 
-app.post("/account/verify-otp", async (req, res) => {
+app.post("/account/verify-otp", rateLimit({ windowMs: 60 * 60 * 1000, maxRequests: 20, keyPrefix: "verify-otp" }), async (req, res) => {
   try {
     const email = normalizeEmail(req.body?.email)
     const otp = String(req.body?.otp || "").trim()
@@ -2009,7 +2057,7 @@ app.get("/my-orders", async (req, res) => {
 /* =========================
    SEND PORTAL LINK
 ========================= */
-app.post("/send-portal-link", async (req, res) => {
+app.post("/send-portal-link", rateLimit({ windowMs: 60 * 60 * 1000, maxRequests: 10, keyPrefix: "portal-link" }), async (req, res) => {
   try {
     const { email } = req.body
     const normalizedEmail = normalizeEmail(email)
@@ -2094,7 +2142,7 @@ app.post("/send-portal-link", async (req, res) => {
 /* =========================
    OPEN PORTAL USING TOKEN OR ORDER ID
 ========================= */
-app.get("/portal-order", async (req, res) => {
+app.get("/portal-order", rateLimit({ windowMs: 60 * 1000, maxRequests: 30, keyPrefix: "portal-order" }), async (req, res) => {
   try {
     const token = String(req.query.token || "").trim()
     const orderId = String(req.query.order || "").trim()
@@ -3547,7 +3595,7 @@ app.post(
   }
 )
 
-app.get("/portal/revision-chat-messages", async (req, res) => {
+app.get("/portal/revision-chat-messages", rateLimit({ windowMs: 60 * 1000, maxRequests: 60, keyPrefix: "chat-poll" }), async (req, res) => {
   try {
     const { orderId } = req.query
     const order = await getOrderByIdOrRazorpay(orderId)
@@ -5832,6 +5880,8 @@ const PORT = process.env.PORT || 3000
 
 app.listen(PORT, () => {
   console.log(`✅ Server running on port ${PORT}`)
+  console.log(`✅ RAZORPAY MODE = ${RAZORPAY_MODE.toUpperCase()}`)
+  console.log(`✅ RATE LIMITING = Enabled on auth + portal endpoints`)
   console.log(`✅ PORTAL_BASE_URL = ${PORTAL_BASE_URL}`)
   console.log(`✅ EMAIL_FROM      = ${EMAIL_FROM}`)
   console.log(`✅ ADMIN_EMAIL     = ${ADMIN_EMAIL}`)
