@@ -2041,6 +2041,9 @@ app.post("/account/logout", async (req, res) => {
 
 /* =========================
    CUSTOMER PROFILE FROM ORDERS
+   NOTE: We do not have a separate customer_profiles table yet.
+   So account profile is derived from the customer's latest order,
+   and saving profile updates every existing order for that email.
 ========================= */
 app.get("/account/profile", async (req, res) => {
   try {
@@ -2050,25 +2053,62 @@ app.get("/account/profile", async (req, res) => {
       return res.status(customer.status || 401).json({ error: customer.error })
     }
 
-    const { data: latestOrder, error } = await supabase
-      .from("orders")
-      .select("name, phone, email, address")
-      .eq("email", customer.email)
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .single()
+    const cleanEmail = normalizeEmail(customer.email)
 
-    if (error || !latestOrder) {
-      return res.status(404).json({ error: "No profile found for this account" })
+    // Do NOT blindly use only the latest order.
+    // Some repeat checkouts can create newer rows where address/pincode is still empty,
+    // while an older order already has the correct delivery pincode.
+    // So we fetch recent orders and pick the most complete profile row first.
+    const { data: customerOrders, error } = await supabase
+      .from("orders")
+      .select("name, phone, email, address, pincode, created_at")
+      .ilike("email", cleanEmail)
+      .order("created_at", { ascending: false })
+      .limit(25)
+
+    if (error) {
+      console.error("❌ Failed to fetch account profile:", error)
+      return res.status(500).json({ error: "Failed to fetch profile" })
+    }
+
+    const orders = Array.isArray(customerOrders) ? customerOrders : []
+
+    const profileOrder =
+      orders.find((order) =>
+        String(order?.name || "").trim() &&
+        String(order?.phone || "").trim() &&
+        String(order?.address || "").trim() &&
+        isValidPincode(order?.pincode)
+      ) ||
+      orders.find((order) => isValidPincode(order?.pincode)) ||
+      orders.find((order) => String(order?.address || "").trim()) ||
+      orders[0] ||
+      null
+
+    // Important: return an empty editable profile instead of 404.
+    // The account page should still allow the customer to add pincode/address.
+    if (!profileOrder) {
+      return res.json({
+        success: true,
+        profile: {
+          name: "",
+          phone: "",
+          email: cleanEmail,
+          address: "",
+          pincode: "",
+          location: "India",
+        },
+      })
     }
 
     return res.json({
       success: true,
       profile: {
-        name: latestOrder.name || "",
-        phone: latestOrder.phone || "",
-        email: latestOrder.email || customer.email,
-        address: latestOrder.address || "",
+        name: profileOrder.name || "",
+        phone: profileOrder.phone || "",
+        email: normalizeEmail(profileOrder.email || cleanEmail),
+        address: profileOrder.address || "",
+        pincode: normalizePincode(profileOrder.pincode || ""),
         location: "India",
       },
     })
@@ -2086,29 +2126,56 @@ app.post("/account/profile", async (req, res) => {
       return res.status(customer.status || 401).json({ error: customer.error })
     }
 
+    const cleanEmail = normalizeEmail(customer.email)
     const name = String(req.body?.name || "").trim()
     const phone = String(req.body?.phone || "").trim()
     const address = String(req.body?.address || "").trim()
+    const pincode = normalizePincode(req.body?.pincode)
 
     if (!name) return res.status(400).json({ error: "Name is required" })
     if (!phone || phone.length < 8) return res.status(400).json({ error: "Valid phone number is required" })
     if (!address) return res.status(400).json({ error: "Address is required" })
+    if (!isValidPincode(pincode)) {
+      return res.status(400).json({ error: "Dear, please enter a valid 6-digit pincode." })
+    }
 
+    const payload = {
+      name,
+      phone,
+      address,
+      pincode,
+      email: cleanEmail,
+    }
+
+    // Case-insensitive email match fixes old orders / sessions with mixed-case emails.
     const { data, error } = await supabase
       .from("orders")
-      .update({ name, phone, address })
-      .eq("email", customer.email)
-      .select("id, name, phone, email, address")
+      .update(payload)
+      .ilike("email", cleanEmail)
+      .select("id, name, phone, email, address, pincode")
 
     if (error) {
       console.error("❌ Failed to update account profile:", error)
       return res.status(500).json({ error: "Failed to update profile" })
     }
 
+    if (!data || data.length === 0) {
+      return res.status(404).json({
+        error: "No order found for this account yet. Please complete checkout once, then save your account details.",
+      })
+    }
+
     return res.json({
       success: true,
-      updatedOrders: data?.length || 0,
-      profile: { name, phone, email: customer.email, address, location: "India" },
+      updatedOrders: data.length,
+      profile: {
+        name,
+        phone,
+        email: cleanEmail,
+        address,
+        pincode,
+        location: "India",
+      },
     })
   } catch (err) {
     console.error("❌ /account/profile update error:", safeErr(err))
