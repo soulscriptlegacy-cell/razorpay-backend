@@ -4591,18 +4591,45 @@ app.get("/admin/orders/:id/download-cover-material", requireAdmin, adminAsync(as
   archive.append(infoLines.join("\n") + "\n", { name: "cover-info.txt" })
 
   if (isCustomCover) {
-    // Custom cover: include up to 3 reference images
+    const coverPhotoPath = firstNonEmpty(intake.cover_photo_path, intake.photo_path)
+    const coverPhotoKey = coverPhotoPath ? cleanStoragePath(coverPhotoPath) : ""
     const referencePaths = normalizeStoragePathArray(intake.reference_image_paths, 10)
 
-    if (referencePaths.length === 0) {
+    if (!coverPhotoPath && referencePaths.length === 0) {
       archive.append(
-        "Customer purchased custom cover but no reference images were uploaded.\n",
-        { name: "REFERENCES-NOTE.txt" }
+        "No cover photograph or reference image was uploaded by the customer.\n",
+        { name: "COVER-MATERIAL-NOTE.txt" }
       )
     } else {
+      if (coverPhotoPath) {
+        const result = await downloadStorageFileWithFallback(
+          [
+            STORAGE_BUCKETS.coverPhotos,
+            STORAGE_BUCKETS.reviewMedia,
+            STORAGE_BUCKETS.coverReferences,
+          ],
+          coverPhotoPath
+        )
+
+        if (!result) {
+          archive.append(
+            `Cover photo path stored: ${coverPhotoPath}\nBut file could not be retrieved from storage.\n`,
+            { name: "COVER-PHOTO-ERROR.txt" }
+          )
+        } else {
+          const originalName = basenameFromPath(coverPhotoPath) || "cover-photo"
+          const safeName = safeFileName(originalName)
+          archive.append(result.buffer, { name: `cover-photo-${safeName}` })
+        }
+      }
+
       let added = 0
+      let attempted = 0
       for (let i = 0; i < referencePaths.length; i++) {
         const path = referencePaths[i]
+        if (coverPhotoKey && cleanStoragePath(path) === coverPhotoKey) continue
+
+        attempted += 1
         const result = await downloadStorageFileWithFallback(
           [
             STORAGE_BUCKETS.coverReferences,
@@ -4622,7 +4649,7 @@ app.get("/admin/orders/:id/download-cover-material", requireAdmin, adminAsync(as
         added += 1
       }
 
-      if (added === 0) {
+      if (attempted > 0 && added === 0) {
         archive.append(
           "Reference images are listed in the database but could not be retrieved from storage.\n",
           { name: "REFERENCES-ERROR.txt" }
